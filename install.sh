@@ -1,31 +1,34 @@
 #!/bin/bash
-# install.sh — one-command setup for Hermes Colab CLI
+# Hermes Colab CLI + Pony Diffusion V6 XL — one-command installer
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HERMES_SCRIPTS="${HOME}/.hermes/scripts/colab"
-HERMES_SKILLS="${HOME}/.hermes/skills/devops/colab-cli"
+COLAB_DEST="$HOME/.hermes/scripts/colab"
+BIN_DIR="$HOME/.local/bin"
 
-echo "=== Hermes Colab CLI Installer ==="
+mkdir -p "$COLAB_DEST" "$BIN_DIR"
 
-# 1. Install official google-colab-cli
-echo "[1/3] Installing google-colab-cli..."
-pip install google-colab-cli 2>/dev/null || pip3 install google-colab-cli
+echo "=== Hermes Colab CLI + Pony Diffusion Installer ==="
 
-# 2. Copy CLI script
-echo "[2/3] Installing colab.py to ${HERMES_SCRIPTS}..."
-mkdir -p "${HERMES_SCRIPTS}"
-cp "${SCRIPT_DIR}/colab.py" "${HERMES_SCRIPTS}/colab.py"
-chmod +x "${HERMES_SCRIPTS}/colab.py"
+# Python deps
+echo "Installing Python dependencies..."
+pip install --quiet google-colab-cli diffusers[torch] "transformers==4.48.0" \
+    accelerate xformers safetensors fastapi uvicorn python-multipart
 
-# 3. Copy skill
-echo "[3/3] Installing skill to ${HERMES_SKILLS}..."
-mkdir -p "${HERMES_SKILLS}/references"
-cp "${SCRIPT_DIR}/SKILL.md" "${HERMES_SKILLS}/SKILL.md"
-cp "${SCRIPT_DIR}/references/auth_flow.md" "${HERMES_SKILLS}/references/auth_flow.md"
+# Colab CLI
+cp "$SCRIPT_DIR/colab.py" "$COLAB_DEST/colab.py"
+chmod +x "$COLAB_DEST/colab.py"
+ln -sf "$COLAB_DEST/colab.py" "$BIN_DIR/colabctl"
+
+# Pony CLI
+cp "$SCRIPT_DIR/pony.py" "$BIN_DIR/pony"
+chmod +x "$BIN_DIR/pony"
 
 echo ""
-echo "Done! Next steps:"
-echo "  1. Authenticate — see references/auth_flow.md"
-echo "  2. Test: python3 ${HERMES_SCRIPTS}/colab.py whoami"
-echo "  3. Use:  python3 ${HERMES_SCRIPTS}/colab.py --help"
+echo "=== Done ==="
+echo "colabctl: $(which colabctl)"
+echo "pony:     $(which pony)"
+echo ""
+echo "Next:"
+echo "  1. Authenticate: see references/auth_flow.md"
+echo "  2. Deploy Pony Diffusion: see AGENTS.md → Pony Diffusion Deployment"

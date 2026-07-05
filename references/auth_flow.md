@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 
 code = "4/0AdkVLP..."  # extracted from the URL you pasted
 CLIENT_ID = "764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com"
-CLIENT_SECRET = "d-FL95Q19q7MQmFpd7hHD0Ty"
+CLIENT_SECRET = "<your-oauth-client-secret>"
 SCOPES = ["openid","https://www.googleapis.com/auth/userinfo.email",
           "https://www.googleapis.com/auth/cloud-platform",
           "https://www.googleapis.com/auth/colaboratory",
@@ -108,6 +108,6 @@ colab --auth=adc sessions
 
 The `redirect_uri=http://localhost` (no port, no PKCE, no `token_usage`) is the
 ONLY combination that Google accepts for this specific OAuth client +
-`ppoppo2051@gmail.com` account. The "copy URL from failed redirect" pattern
+`<your-google-account>` account. The "copy URL from failed redirect" pattern
 works because we don't need the browser to actually reach localhost — we just
 need the `code` parameter from the redirect URL.

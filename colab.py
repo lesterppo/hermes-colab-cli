@@ -396,6 +396,74 @@ def cmd_log(args):
     check_rc(stdout, stderr, rc, "log-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
 
+
+def cmd_logs(args):
+    """Tail a file on the Colab VM, with optional --follow streaming."""
+    s = _resolve_session(args) or args.session
+    filepath = args.filepath
+    lines = getattr(args, "lines", 50) or 50
+    follow = getattr(args, "follow", False)
+    
+    if follow:
+        import signal
+        stop = [False]
+        def on_sigint(sig, frame):
+            stop[0] = True
+        prev = signal.signal(signal.SIGINT, on_sigint)
+        try:
+            print(f"Streaming {filepath} (Ctrl+C to stop)...")
+            last_size = 0
+            while not stop[0]:
+                code = f"import os\ntry:\n    size = os.path.getsize({json.dumps(filepath)})\n    if size > {last_size}:\n        with open({json.dumps(filepath)}) as f:\n            f.seek({last_size})\n            print(f.read(), end='')\n        print('\\n__SIZE__:' + str(size))\nexcept Exception as e:\n    print('__ERR__:' + str(e))"
+                cargs = ["exec"]
+                if s: cargs.extend(["-s", s])
+                cargs.extend(["--timeout", "12"])
+                stdout, stderr, rc = run_colab(cargs, timeout=15, stdin_data=code)
+                if rc == 0 and stdout.strip():
+                    # Split size marker from content
+                    if '__SIZE__:' in stdout:
+                        content, marker = stdout.rsplit('__SIZE__:', 1)
+                        if content.strip():
+                            print(content, end='', flush=True)
+                        try:
+                            last_size = int(marker.strip().split('\n')[0])
+                        except ValueError:
+                            pass
+                time.sleep(1.0)
+        finally:
+            signal.signal(signal.SIGINT, prev)
+            if stop[0]:
+                print("\nStopped.")
+    else:
+        code = f"import subprocess, sys\nr = subprocess.run(['tail', '-n', str({lines}), {json.dumps(filepath)}], capture_output=True, text=True)\nprint(r.stdout, end='')\nif r.stderr: print(r.stderr, end='')"
+        cargs = ["exec"]
+        if s: cargs.extend(["-s", s])
+        cargs.extend(["--timeout", "15"])
+        stdout, stderr, rc = run_colab(cargs, timeout=20, stdin_data=code)
+        check_rc(stdout, stderr, rc, "logs-failed", stdout.strip() or stderr.strip())
+        write_output(stdout, args.out, args.json)
+
+
+def cmd_check(args):
+    """Pre-flight model check: test imports before full deployment."""
+    s = _resolve_session(args) or args.session
+    code = args.code
+    if not code:
+        die("check-no-code", "Provide --code with Python to test")
+    
+    cargs = ["exec"]
+    if s: cargs.extend(["-s", s])
+    t = getattr(args, "timeout", 60) or 60
+    cargs.extend(["--timeout", str(t)])
+    
+    print(f"Running pre-flight check on {s or 'auto'}...")
+    stdout, stderr, rc = run_colab(cargs, timeout=t + 30, stdin_data=code)
+    
+    if rc == 0:
+        write_output(f"PASS:\n{stdout}", args.out, args.json, {"status": "pass"})
+    else:
+        write_output(f"FAIL:\n{stdout}\n{stderr}", args.out, args.json, {"status": "fail"})
+
 def cmd_notebook(args):
     """Export session or execute notebook file."""
     s = _resolve_session(args) or args.session
@@ -642,6 +710,12 @@ def build_parser():
     pr3 = sub.add_parser("repl", parents=[shared_output], help="Python REPL"); pr3.add_argument("-s", "--session"); pr3.add_argument("--code"); pr3.add_argument("--output-image"); pr3.add_argument("--timeout", type=float, default=60.0)
     pc = sub.add_parser("console", parents=[shared_output], help="Shell command"); pc.add_argument("-s", "--session"); pc.add_argument("--cmd", help="Shell command to run"); pc.add_argument("--timeout", type=float, default=60.0)
 
+    # VM file ops
+    plogs = sub.add_parser("logs", parents=[shared_output], help="Tail VM file")
+    plogs.add_argument("-s", "--session"); plogs.add_argument("filepath", help="Path on VM (e.g. /content/server.log)")
+    plogs.add_argument("-n", "--lines", type=int, default=50, help="Lines to show")
+    plogs.add_argument("-f", "--follow", action="store_true", help="Stream output (Ctrl+C to stop)")
+
     # File ops
     pl = sub.add_parser("ls", parents=[shared_output], help="List files"); pl.add_argument("-s", "--session"); pl.add_argument("path", nargs="?")
     pu = sub.add_parser("upload", parents=[shared_output], help="Upload file"); pu.add_argument("-s", "--session"); pu.add_argument("local"); pu.add_argument("remote")
@@ -651,6 +725,7 @@ def build_parser():
 
     # Automation
     pi = sub.add_parser("install", parents=[shared_output], help="Install packages"); pi.add_argument("-s", "--session"); pi.add_argument("-r", "--requirements"); pi.add_argument("--pip-args", help="Extra pip flags"); pi.add_argument("packages", nargs="*")
+    pchk = sub.add_parser("check", parents=[shared_output], help="Pre-flight model test"); pchk.add_argument("-s", "--session"); pchk.add_argument("--code", required=True, help="Python to test"); pchk.add_argument("--timeout", type=float, default=60.0)
     pl2 = sub.add_parser("log", parents=[shared_output], help="View/export history"); pl2.add_argument("-s", "--session"); pl2.add_argument("-n", "--lines", type=int); pl2.add_argument("-t", "--event-type"); pl2.add_argument("--output")
     pn2 = sub.add_parser("notebook", parents=[shared_output], help="Notebook export/execute"); pn2.add_argument("-s", "--session"); pn2.add_argument("action", nargs="?", choices=["export","execute"], default="export", help="export or execute"); pn2.add_argument("--output", help="Export path"); pn2.add_argument("--file", help="Notebook file to execute")
     purl = sub.add_parser("url", parents=[shared_output], help="Get browser URL"); purl.add_argument("-s", "--session"); purl.add_argument("--open", dest="open_browser", action="store_true")
@@ -686,6 +761,7 @@ def main():
         "install": cmd_install, "log": cmd_log, "notebook": cmd_notebook,
         "url": cmd_url, "drivemount": cmd_drivemount, "auth": cmd_auth,
         "console": cmd_console, "edit": cmd_edit, "repl": cmd_repl,
+        "logs": cmd_logs, "check": cmd_check,
         "pay": cmd_pay, "version": cmd_version, "update": cmd_update, "whoami": cmd_whoami,
         "secrets": cmd_secrets, "resources": cmd_resources, "share": cmd_share, "tunnel": cmd_tunnel,
     }
