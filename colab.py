@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
-"""colab-cli v2.1 — AI-agent-native CLI for Google Colab.
+"""colab-cli v3.1 — AI-agent-native CLI for Google Colab.
 
-Fixes over v2.0:
-- console: fixed stdin piping (uses exec+subprocess for shell commands)
-- install: added --pip-args for custom pip flags
-- auth: auto-refresh expired tokens
-- exec_bg: background execution with progress polling
-- gpu_switch: change GPU on running session
-- notebook: create/save .ipynb files
-- tunnel: persistent Cloudflare tunnel URL tracking
+Fixes over v3.0:
+- P0: Retry logic for transient Colab errors (502/503/timeout), up to 2 retries
+- P0: cmd_console shell injection fixed — json.dumps() escaping
+- P0: tunnel_discover shell=True replaced with list-form subprocess
+- P1: _remote_exists/_remote_read use json.dumps() for path safety
+- P1: Auth pre-check window widened from 120s to 300s
+- P1: shlex.split() for pip args (handles quoted arguments)
+- P1: Browser sleeps replaced with wait_for_selector / wait_for_timeout
+- P2: All =run_colab / =_remote_pexec spacing fixed
 
 Wraps the official google-colab-cli with token-efficient output.
 """
 
-import argparse, json, os, subprocess, sys, time, re
+import argparse, json, os, subprocess, sys, time, re, shlex, urllib.request, urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
+import threading
 
 COLAB_HOME = Path.home() / ".hermes" / "scripts" / "colab"
 COLAB_HOME.mkdir(parents=True, exist_ok=True)
 TUNNEL_FILE = COLAB_HOME / "tunnel_url.json"
 TOKEN_FILE = Path.home() / ".config" / "colab-cli" / "token.json"
+CACHE_DIR = Path.home() / ".cache" / "colab-cli"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Auth token management ──────────────────────────────────────────────────
+
+_token_lock = threading.Lock()
+_token_stop_event = threading.Event()
+_refresher_thread = None
 
 def _find_colab():
     import shutil
@@ -36,22 +47,48 @@ def die(code, msg):
     print(json.dumps({"ok": False, "err": code, "msg": msg}))
     sys.exit(1)
 
-def run_colab(args, timeout=120, stdin_data=None, env=None):
+RETRYABLE_CODES = (502, 503, 504)  # Colab transient errors
+MAX_RETRIES = 2
+RETRY_DELAY = 3  # seconds
+
+def _is_retryable(stderr, rc):
+    """Check if the error is transient and worth retrying."""
+    combined = (stderr or "").lower()
+    if rc in RETRYABLE_CODES:
+        return True
+    for phrase in ("connection reset", "connection refused", "service unavailable",
+                   "temporarily unavailable", "backend error", "try again"):
+        if phrase in combined:
+            return True
+    return False
+
+def run_colab(args, timeout=120, stdin_data=None, env=None, retries=MAX_RETRIES):
     cmd = [COLAB] + args
     merged_env = os.environ.copy()
     if env: merged_env.update(env)
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=merged_env, input=stdin_data)
-        return r.stdout, r.stderr, r.returncode
-    except subprocess.TimeoutExpired:
-        return "", "timeout", -1
-    except FileNotFoundError:
-        return "", "colab binary not found", -2
+    last_stdout, last_stderr, last_rc = "", "", -1
+    for attempt in range(retries + 1):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                               env=merged_env, input=stdin_data)
+            if r.returncode == 0 or not _is_retryable(r.stderr, r.returncode):
+                return r.stdout, r.stderr, r.returncode
+            last_stdout, last_stderr, last_rc = r.stdout, r.stderr, r.returncode
+            if attempt < retries:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+        except subprocess.TimeoutExpired:
+            if attempt < retries and retries > 0:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+            return "", "timeout", -1
+        except FileNotFoundError:
+            return "", "colab binary not found", -2
+    return last_stdout, last_stderr, last_rc
 
 def parse_error(stdout, stderr):
     combined = (stdout + "\n" + stderr).lower()
     if "auth" in combined and ("expired" in combined or "invalid" in combined):
-        return "auth-expired", "Token expired. See references/auth_flow.md to re-authenticate."
+        return "auth-expired", "Token expired."
     if "unauthorized" in combined or "authentication" in combined:
         return "auth-expired", "Auth required."
     if "rate" in combined and "limit" in combined:
@@ -91,33 +128,80 @@ def check_rc(stdout, stderr, rc, fallback_code, fallback_msg):
         if err_code:
             if err_code == "auth-expired":
                 _try_refresh_token()
-                die(err_code, err_msg)
+                # If refresh worked, caller can retry; but simplest is just to report
             die(err_code, err_msg or stderr.strip())
         die(fallback_code, stderr.strip() or stdout.strip() or fallback_msg)
 
 def _try_refresh_token():
-    """Attempt to refresh OAuth2 token."""
+    """Attempt to refresh OAuth2 token. Returns True on success."""
+    if not TOKEN_FILE.exists(): return False
+    try:
+        with _token_lock:
+            creds = json.loads(TOKEN_FILE.read_text())
+            if not creds.get("refresh_token"): return False
+            data = urllib.parse.urlencode({
+                "client_id": creds.get("client_id", ""),
+                "client_secret": creds.get("client_secret", ""),
+                "refresh_token": creds["refresh_token"],
+                "grant_type": "refresh_token",
+            }).encode()
+            req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            resp = urllib.request.urlopen(req, timeout=15)
+            t = json.loads(resp.read())
+            creds["token"] = t["access_token"]
+            creds["expiry"] = datetime.fromtimestamp(
+                datetime.now(timezone.utc).timestamp() + t.get("expires_in", 3600),
+                tz=timezone.utc).isoformat()
+            TOKEN_FILE.write_text(json.dumps(creds, indent=2))
+            return True
+    except Exception:
+        return False
+
+def _token_expires_soon(seconds_before=300):
+    """Check if token expires within N seconds. Token expiry is stored as ISO string."""
     if not TOKEN_FILE.exists(): return False
     try:
         creds = json.loads(TOKEN_FILE.read_text())
-        if not creds.get("refresh_token"): return False
-        import urllib.request as ur
-        data = urllib.parse.urlencode({
-            "client_id": creds.get("client_id", ""),
-            "client_secret": creds.get("client_secret", ""),
-            "refresh_token": creds["refresh_token"],
-            "grant_type": "refresh_token",
-        }).encode()
-        req = ur.Request("https://oauth2.googleapis.com/token", data=data)
-        req.add_header("Content-Type", "application/x-www-form-urlencoded")
-        resp = ur.urlopen(req, timeout=15)
-        t = json.loads(resp.read())
-        creds["token"] = t["access_token"]
-        creds["expiry"] = (__import__("datetime").datetime.now(__import__("datetime").timezone.utc).timestamp() + t.get("expires_in", 3600))
-        TOKEN_FILE.write_text(json.dumps(creds, indent=2))
-        return True
+        expiry_str = creds.get("expiry", "")
+        if not expiry_str: return False
+        # Handle both float epoch and ISO format
+        if isinstance(expiry_str, (int, float)):
+            expiry_ts = float(expiry_str)
+        else:
+            expiry_dt = datetime.fromisoformat(expiry_str.replace("+00:00", "").replace("Z", ""))
+            expiry_ts = expiry_dt.timestamp()
+        return (expiry_ts - datetime.now(timezone.utc).timestamp()) < seconds_before
     except Exception:
         return False
+
+def _start_token_refresher():
+    """Background thread: refresh token every 5 min if expiring soon."""
+    global _refresher_thread
+    if _refresher_thread and _refresher_thread.is_alive():
+        return
+
+    def _refresher_loop():
+        while not _token_stop_event.is_set():
+            try:
+                if _token_expires_soon(300):
+                    refreshed = _try_refresh_token()
+                    if refreshed:
+                        ts = datetime.now().strftime("%H:%M:%S")
+                        sys.stderr.write(f"[colab-cli {ts}] Token auto-refreshed\n")
+                        sys.stderr.flush()
+            except Exception:
+                pass
+            _token_stop_event.wait(300)  # check every 5 min
+
+    _refresher_thread = threading.Thread(target=_refresher_loop, daemon=True)
+    _refresher_thread.start()
+
+def _pre_auth_check():
+    """Ensure auth is valid before command runs. Attempt refresh if needed."""
+    if _token_expires_soon(300):
+        _try_refresh_token()
+    _start_token_refresher()
 
 def format_sessions_list(stdout):
     sessions = []
@@ -137,9 +221,29 @@ def _resolve_session(args):
         if len(sessions) == 1: return sessions[0]["name"]
     return None
 
-# ─── Commands ──────────────────────────────────────────────────────────────────
+# ─── Core VM helpers ──────────────────────────────────────────────────────
+
+def _remote_exists(session, path):
+    """Check if a file exists on the VM."""
+    code = "import os; print('YES' if os.path.exists(%s) else 'NO')" % json.dumps(path)
+    stdout, stderr, rc = run_colab(["exec", "-s", session, "--timeout", "5"], timeout=10, stdin_data=code)
+    return rc == 0 and "YES" in stdout
+
+def _remote_read(session, path):
+    """Read a text file from the VM."""
+    code = "print(open(%s).read())" % json.dumps(path)
+    stdout, stderr, rc = run_colab(["exec", "-s", session, "--timeout", "10"], timeout=15, stdin_data=code)
+    return stdout if rc == 0 else None
+
+def _remote_pexec(session, code, timeout=10):
+    """Run Python code on VM, return (stdout, stderr, rc)."""
+    cargs = ["exec", "-s", session, "--timeout", str(max(timeout, 5))]
+    return run_colab(cargs, timeout=timeout + 15, stdin_data=code)
+
+# ─── Commands ──────────────────────────────────────────────────────────────
 
 def cmd_new(args):
+    _pre_auth_check()
     cargs = ["new"]
     if args.session: cargs.extend(["-s", args.session])
     if getattr(args, "gpu", None): cargs.extend(["--gpu", args.gpu])
@@ -150,6 +254,7 @@ def cmd_new(args):
     write_output(f"Session '{name}' created.\n{stdout.strip()}", args.out, args.json, {"session": name})
 
 def cmd_exec(args):
+    _pre_auth_check()
     cargs = ["exec"]
     s = _resolve_session(args) or args.session
     if s: cargs.extend(["-s", s])
@@ -162,12 +267,191 @@ def cmd_exec(args):
     check_rc(stdout, stderr, rc, "exec-failed", "Execution failed")
     write_output(stdout, args.out, args.json)
 
-def cmd_exec_bg(args):
-    """Background execution — spawns a separate process, returns job ID for polling."""
-    import uuid
+# ── P0: exec_detach — upload code + run detached, returns immediately ─────
+
+def cmd_exec_detach(args):
+    """Upload code file, run it with nohup/start_new_session, return PID immediately.
+
+    This is THE way to launch long-running servers (llama.cpp, FastAPI, tunnels).
+    Unlike exec (which blocks) or exec_bg (which runs Code as exec text),
+    this uploads a script and runs it as a proper background process.
+    """
+    _pre_auth_check()
     s = _resolve_session(args) or args.session
+    if not s: die("exec-detach-no-session", "Specify -s SESSION or create one first")
+
+    local_file = getattr(args, "file", None)
+    code = getattr(args, "code", None)
+    remote_path = getattr(args, "remote", None)
+    log_file = getattr(args, "log", None) or "/dev/null"
+    work_dir = getattr(args, "dir", None) or "/content"
+
+    # Resolve local file path
+    if local_file:
+        local_path = Path(local_file)
+        if not local_path.is_absolute():
+            local_path = Path.cwd() / local_path
+        if not local_path.exists():
+            die("exec-detach-no-file", f"File not found: {local_file}")
+        remote_path = remote_path or f"/content/{local_path.name}"
+
+        # Upload the file
+        stdout, stderr, rc = run_colab(["upload", "-s", s, str(local_path), remote_path], timeout=60)
+        check_rc(stdout, stderr, rc, "upload-failed", "Upload failed")
+
+    elif code:
+        remote_path = remote_path or "/content/detach_script.py"
+        # Write code to temp file and upload
+        tmp = COLAB_HOME / "detach_code.py"
+        tmp.write_text(code)
+        stdout, stderr, rc = run_colab(["upload", "-s", s, str(tmp), remote_path], timeout=60)
+        check_rc(stdout, stderr, rc, "upload-failed", "Upload failed")
+    else:
+        die("exec-detach-no-code", "Provide --file LOCAL or --code ...")
+
+    # Launch detached on VM
+    launch_code = (
+        "import subprocess, sys, os\n"
+        "p = subprocess.Popen(\n"
+        "    [sys.executable, '%s'],\n"
+        "    stdout=open('%s', 'w'), stderr=subprocess.STDOUT,\n"
+        "    start_new_session=True, cwd='%s'\n"
+        ")\n"
+        "print(f'PID:{p.pid}|SESSION:%s|LOG:%s|SCRIPT:%s')"
+    ) % (remote_path, log_file, work_dir, s, log_file, remote_path)
+
+    stdout, stderr, rc = _remote_pexec(s, launch_code, timeout=15)
+    if rc == 0 and "PID:" in stdout:
+        info = {}
+        for part in stdout.strip().split("|"):
+            if ":" in part:
+                k, v = part.split(":", 1)
+                info[k] = v
+        write_output("", args.out, args.json, {
+            "status": "detached",
+            "pid": info.get("PID"),
+            "log": info.get("LOG"),
+            "script": info.get("SCRIPT"),
+            "session": s,
+            "monitor": f"python3 ~/.hermes/scripts/colab/colab.py logs -s {s} {log_file.replace('/content/', '/content/')} -f"
+        })
+    else:
+        die("exec-detach-failed", stdout.strip())
+
+
+# ── P1: exec_file — upload + exec in one step ─────────────────────────────
+
+def cmd_exec_file(args):
+    """Upload a local script and execute it on the VM in one step.
+
+    Combines upload + exec into a single command.
+    """
+    _pre_auth_check()
+    s = _resolve_session(args) or args.session
+    if not s: die("exec-file-no-session", "Specify -s SESSION or create one first")
+
+    local_path = Path(args.file)
+    if not local_path.is_absolute():
+        local_path = Path.cwd() / local_path
+    if not local_path.exists():
+        die("exec-file-not-found", f"File not found: {args.file}")
+
+    remote_path = getattr(args, "remote", None) or f"/content/{local_path.name}"
+
+    # Upload
+    stdout, stderr, rc = run_colab(["upload", "-s", s, str(local_path), remote_path], timeout=60)
+    check_rc(stdout, stderr, rc, "upload-failed", "Upload failed")
+
+    # Execute
+    t = getattr(args, "timeout", 30) or 30
+    code = f"import subprocess, sys; r = subprocess.run([sys.executable, '{remote_path}'], capture_output=True, text=True, timeout={t}); print(r.stdout); print(r.stderr, file=sys.stderr if r.returncode else sys.stdout)"
+    cargs = ["exec", "-s", s, "--timeout", str(t)]
+    stdout, stderr, rc = run_colab(cargs, timeout=t + 60, stdin_data=code)
+    check_rc(stdout, stderr, rc, "exec-file-failed", "Script execution failed")
+    write_output(stdout, args.out, args.json, {"file": str(local_path), "remote": remote_path})
+
+
+# ── P1: tunnel discover — auto-grep VM for live tunnel URL ────────────────
+
+def cmd_tunnel_discover(args):
+    """Search the VM for a live Cloudflare tunnel URL.
+
+    Checks common locations: /content/tunnel.log, /content/api_url.txt,
+    /kaggle/working/tunnel.log, /content/*.log patterns.
+    """
+    _pre_auth_check()
+    s = _resolve_session(args) or args.session
+    if not s: die("tunnel-discover-no-session", "Specify -s SESSION or create one first")
+
+    search_code = (
+        "import os, re, glob\n"
+        "urls = []\n"
+        "patterns = [\n"
+        "    '/content/tunnel.log', '/content/api_url.txt',\n"
+        "    '/content/*.log', '/content/*deploy*.log',\n"
+        "    '/content/server*.log', '/kaggle/working/tunnel.log',\n"
+        "    '/kaggle/working/api_url.txt'\n"
+        "]\n"
+        "files_to_check = set()\n"
+        "for pat in patterns:\n"
+        "    files_to_check.update(glob.glob(pat))\n"
+        "# Also check explicit paths\n"
+        "for f in ['/content/tunnel.log', '/content/api_url.txt']:\n"
+        "    if os.path.exists(f): files_to_check.add(f)\n"
+        "for f in sorted(files_to_check):\n"
+        "    try:\n"
+        "        content = open(f).read()\n"
+        "        found = re.findall(r'https://[a-zA-Z0-9.-]*\\.trycloudflare\\\\.com[^\\s\"\\'<>]*', content)\n"
+        "        if found:\n"
+        "            for u in found:\n"
+        "                clean = u.rstrip('/')\n"
+        "                if '/v1' not in clean:\n"
+        "                    clean += '/v1'\n"
+        "                urls.append({'url': clean, 'source': f})\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "# Also try running process check\n"
+        "try:\n"
+        "    import subprocess as _sp\n"
+        "    r = _sp.run(['ps', 'aux'], capture_output=True, text=True)\n"
+        "    if 'cloudflared' in r.stdout:\n"
+        "        urls.append({'url': 'process_running', 'source': 'ps_aux'})\n"
+        "except: pass\n"
+        "if urls:\n"
+        "    import json\n"
+        "    print(json.dumps({'ok': True, 'tunnels': urls}))\n"
+        "else:\n"
+        "    print(json.dumps({'ok': False, 'err': 'not-found', 'msg': 'No tunnel URLs found on VM'}))\n"
+    )
+    stdout, stderr, rc = _remote_pexec(s, search_code, timeout=15)
+    try:
+        result = json.loads(stdout.strip())
+    except json.JSONDecodeError:
+        result = {"ok": False, "err": "parse-error", "msg": stdout.strip()[:200]}
+
+    if result.get("ok"):
+        tunnels = result.get("tunnels", [])
+        # Save all found URLs
+        for t in tunnels:
+            if "trycloudflare" in t.get("url", ""):
+                data = json.loads(TUNNEL_FILE.read_text()) if TUNNEL_FILE.exists() else {}
+                data[s] = t["url"]
+                TUNNEL_FILE.write_text(json.dumps(data, indent=2))
+        write_output(json.dumps(tunnels, indent=2), args.out, args.json, {"count": len(tunnels), "tunnels": tunnels})
+    else:
+        die("tunnel-discover-failed", result.get("msg", "No tunnels found"))
+
+
+# ── P2: Fixed exec_bg with proper job tracking ────────────────────────────
+
+def cmd_exec_bg(args):
+    """Background execution — uploads code, runs it via exec_detach, returns job_id."""
+    import uuid
+    _pre_auth_check()
+    s = _resolve_session(args) or args.session
+    if not s: die("exec-bg-no-session", "Specify -s SESSION or create one first")
+
     job_id = str(uuid.uuid4())[:8]
-    out_file = str(COLAB_HOME / f"bg_{job_id}.txt")
     timeout = getattr(args, "timeout", 600) or 600
 
     code = getattr(args, "code", None)
@@ -176,52 +460,80 @@ def cmd_exec_bg(args):
     if not code:
         die("exec-bg-no-code", "No code provided. Use --code or pipe via stdin.")
 
-    # Write code to temp file and spawn process
+    # Write code to temp file
     code_file = COLAB_HOME / f"bg_{job_id}_code.py"
     code_file.write_text(code)
+    remote_path = f"/tmp/bg_{job_id}.py"
+    log_path = f"/tmp/bg_{job_id}.log"
 
-    runner = COLAB_HOME / "bg_runner.py"
-    if not runner.exists():
-        runner.write_text("""#!/usr/bin/env python3
-import subprocess, sys, json, os
-job_id, session, code_file, out_file, timeout = sys.argv[1:7]
-code = open(code_file).read()
-cargs = ["exec", "-s", session, "--timeout", timeout]
-r = subprocess.run([sys.executable.replace('python3','colab').replace('/bin/colab', 'colab')], 
-    capture_output=True, text=True, timeout=int(timeout)+60, input=code)
-# Actually just use subprocess with colab directly
-""")
+    # Upload
+    stdout, stderr, rc = run_colab(["upload", "-s", s, str(code_file), remote_path], timeout=60)
+    check_rc(stdout, stderr, rc, "upload-failed", "Upload failed")
 
-    # Spawn directly with subprocess.Popen
-    cargs = ["exec"]
-    if s: cargs.extend(["-s", s])
-    cargs.extend(["--timeout", str(timeout)])
-    
-    pid = os.fork()
-    if pid == 0:
-        # Child: run exec and write output
-        stdout, stderr, rc = run_colab(cargs, timeout=timeout + 60, stdin_data=code)
-        Path(out_file).write_text(stdout if rc == 0 else (stderr or stdout or "BG exec failed"))
-        os._exit(0)
+    # Launch detached
+    launch_code = (
+        "import subprocess, sys, os, json\n"
+        "p = subprocess.Popen(\n"
+        "    [sys.executable, '%s'],\n"
+        "    stdout=open('%s', 'w'), stderr=subprocess.STDOUT,\n"
+        "    start_new_session=True\n"
+        ")\n"
+        "print(json.dumps({'pid': p.pid, 'job_id': '%s', 'session': '%s'}))"
+    ) % (remote_path, log_path, job_id, s)
 
-    write_output("", args.out, args.json, {"job_id": job_id, "status": "running", "poll": f"exec_bg_poll {job_id}"})
+    stdout, stderr, rc = _remote_pexec(s, launch_code, timeout=15)
+    try:
+        info = json.loads(stdout.strip())
+    except json.JSONDecodeError:
+        info = {"raw": stdout.strip()}
+
+    write_output("", args.out, args.json, {
+        "job_id": job_id,
+        "pid": info.get("pid"),
+        "status": "running",
+        "session": s,
+        "log": f"{{'code'}}logs -s {s} {log_path} -f",
+        "poll": f"exec_bg_poll {job_id}",
+        "code_file": str(code_file),
+    })
+
 
 def cmd_exec_bg_poll(args):
-    """Poll a background execution job."""
+    """Poll a background execution job — checks VM log file."""
+    _pre_auth_check()
     job_id = args.job_id
-    out_file = COLAB_HOME / f"bg_{job_id}.txt"
-    if not out_file.exists():
-        write_output("", args.out, args.json, {"job_id": job_id, "status": "running"})
-        return
-    content = out_file.read_text()
-    if content.startswith("{"):
-        try:
-            data = json.loads(content)
-            write_output(content, args.out, args.json, {"job_id": job_id, "status": data.get("err", "done")})
-        except: pass
-    write_output(content, args.out, args.json, {"job_id": job_id, "status": "done"})
+    session = getattr(args, "session", None)
 
+    # Auto-detect session if not specified
+    if not session:
+        stdout, stderr, rc = run_colab(["sessions"], timeout=10)
+        if rc == 0:
+            slist = format_sessions_list(stdout)
+            if slist:
+                session = slist[0]["name"]
+
+    if session:
+        log_path = f"/tmp/bg_{job_id}.log"
+        code = f"import os; print('EXISTS' if os.path.exists('{log_path}') else 'NO')"
+        stdout, stderr, rc = _remote_pexec(session, code, timeout=5)
+        if rc == 0 and "EXISTS" in stdout:
+            content_text = _remote_read(session, log_path)
+            if content_text:
+                write_output(content_text, args.out, args.json, {
+                    "job_id": job_id,
+                    "session": session,
+                    "status": "done",
+                    "size": len(content_text)
+                })
+                return
+
+    write_output("", args.out, args.json, {
+        "job_id": job_id,
+        "status": "running",
+        "msg": "Job still running or session not found"
+    })
 def cmd_run(args):
+    _pre_auth_check()
     cargs = ["run"]
     if getattr(args, "gpu", None): cargs.extend(["--gpu", args.gpu])
     if getattr(args, "tpu", None): cargs.extend(["--tpu", args.tpu])
@@ -237,14 +549,18 @@ def cmd_run(args):
     check_rc(stdout, stderr, rc, "run-failed", "Job failed")
     write_output(stdout, args.out, args.json)
 
+
 def cmd_sessions(args):
+    _pre_auth_check()
     stdout, stderr, rc = run_colab(["sessions"], timeout=30)
     check_rc(stdout, stderr, rc, "sessions-failed", stdout.strip())
     sessions_data = format_sessions_list(stdout)
     if args.json: print(json.dumps({"ok": True, "sessions": sessions_data}))
     else: write_output(stdout, args.out, args.json, {"sessions": sessions_data})
 
+
 def cmd_status(args):
+    _pre_auth_check()
     cargs = ["status"]
     s = _resolve_session(args) or args.session
     if s: cargs.extend(["-s", s])
@@ -252,37 +568,33 @@ def cmd_status(args):
     check_rc(stdout, stderr, rc, "status-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
 
+
 def cmd_stop(args):
+    _pre_auth_check()
     s = _resolve_session(args) or args.session
     cargs = ["stop"]
     if s: cargs.extend(["-s", s])
     stdout, stderr, rc = run_colab(cargs, timeout=30)
     check_rc(stdout, stderr, rc, "stop-failed", stdout.strip())
-    # Clear tunnel URL
-    if TUNNEL_FILE.exists(): TUNNEL_FILE.unlink()
+    if TUNNEL_FILE.exists():
+        data = json.loads(TUNNEL_FILE.read_text())
+        if s in data:
+            del data[s]
+            TUNNEL_FILE.write_text(json.dumps(data, indent=2))
     write_output(f"Session '{s}' stopped." if s else "Session stopped.", args.out, args.json)
 
+
 def cmd_gpu_switch(args):
-    """Switch GPU type on a running session by stopping and recreating."""
     s = _resolve_session(args) or args.session
     new_gpu = args.gpu
     if not new_gpu: die("gpu-switch-no-gpu", "Specify --gpu target")
-    # Get current status
-    cargs = ["status"]
-    if s: cargs.extend(["-s", s])
-    stdout, _, _ = run_colab(cargs, timeout=15)
-
-    # Stop current
-    cargs = ["stop"]
-    if s: cargs.extend(["-s", s])
-    stdout2, stderr2, rc2 = run_colab(cargs, timeout=30)
-    # Allow failure (session may already be stopping)
-
-    # Create new with different GPU
+    cargs = ["stop", "-s", s]
+    run_colab(cargs, timeout=30)
     cargs = ["new", "-s", s, "--gpu", new_gpu]
     stdout3, stderr3, rc3 = run_colab(cargs, timeout=120)
     check_rc(stdout3, stderr3, rc3, "gpu-switch-failed", f"Failed to recreate with {new_gpu}")
     write_output(f"GPU switched to {new_gpu} on session '{s}'.\n{stdout3.strip()}", args.out, args.json, {"session": s, "gpu": new_gpu})
+
 
 def cmd_ls(args):
     cargs = ["ls"]
@@ -293,6 +605,7 @@ def cmd_ls(args):
     check_rc(stdout, stderr, rc, "ls-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
 
+
 def cmd_upload(args):
     cargs = ["upload"]
     s = _resolve_session(args) or args.session
@@ -301,6 +614,7 @@ def cmd_upload(args):
     stdout, stderr, rc = run_colab(cargs, timeout=60)
     check_rc(stdout, stderr, rc, "upload-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
+
 
 def cmd_download(args):
     cargs = ["download"]
@@ -311,6 +625,7 @@ def cmd_download(args):
     check_rc(stdout, stderr, rc, "download-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
 
+
 def cmd_rm(args):
     cargs = ["rm"]
     s = _resolve_session(args) or args.session
@@ -320,6 +635,7 @@ def cmd_rm(args):
     check_rc(stdout, stderr, rc, "rm-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
 
+
 def cmd_install(args):
     cargs = ["install"]
     s = _resolve_session(args) or args.session
@@ -327,18 +643,16 @@ def cmd_install(args):
     if getattr(args, "requirements", None): cargs.extend(["-r", args.requirements])
     pkgs = getattr(args, "packages", None)
     if pkgs: cargs.extend(pkgs)
-    # pip-args: inject via exec if needed (official install doesn't support it)
     pip_args = getattr(args, "pip_args", None)
     if pip_args:
-        # Fall through to exec-based install
-        code = f"import subprocess, sys\nsubprocess.run([sys.executable, '-m', 'pip', 'install', {json.dumps(' '.join(pkgs))}] + {json.dumps(pip_args.split())})"
+        code = f"import subprocess, sys\nsubprocess.run([sys.executable, '-m', 'pip', 'install', {json.dumps(' '.join(pkgs))}] + {json.dumps(shlex.split(pip_args))})\n"
         return cmd_exec_custom(args, s, code)
     stdout, stderr, rc = run_colab(cargs, timeout=120)
     check_rc(stdout, stderr, rc, "install-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
 
+
 def cmd_exec_custom(args, session, code):
-    """Internal: execute custom Python code via exec."""
     cargs = ["exec"]
     if session: cargs.extend(["-s", session])
     t = getattr(args, "timeout", 120) or 120
@@ -346,6 +660,7 @@ def cmd_exec_custom(args, session, code):
     stdout, stderr, rc = run_colab(cargs, timeout=t + 60, stdin_data=code)
     check_rc(stdout, stderr, rc, "exec-failed", "Execution failed")
     write_output(stdout, args.out, args.json)
+
 
 def cmd_console(args):
     """Shell commands via exec+subprocess (avoids tmux garbling)."""
@@ -356,8 +671,12 @@ def cmd_console(args):
             cmd_str = sys.stdin.read().strip()
     if not cmd_str:
         die("console-no-input", "No command provided. Use --command 'CMD' or pipe via stdin.")
-    # Use exec to run the shell command via subprocess
-    code = f"import subprocess, json\nr=subprocess.run({json.dumps(cmd_str)}, shell=True, capture_output=True, text=True)\nif r.stdout: print(r.stdout, end='')\nif r.stderr: print(r.stderr, end='')"
+    code = (
+        "import subprocess\n"
+        "r = subprocess.run(%s, shell=True, capture_output=True, text=True)\n"
+        "if r.stdout: print(r.stdout, end='')\n"
+        "if r.stderr: print(r.stderr, end='')"
+    ) % json.dumps(cmd_str)
     cargs = ["exec"]
     if s: cargs.extend(["-s", s])
     t = getattr(args, "timeout", 60) or 60
@@ -365,6 +684,7 @@ def cmd_console(args):
     stdout, stderr, rc = run_colab(cargs, timeout=t + 30, stdin_data=code)
     check_rc(stdout, stderr, rc, "console-failed", stdout.strip() or stderr.strip())
     write_output(stdout, args.out, args.json)
+
 
 def cmd_edit(args):
     cargs = ["edit"]
@@ -375,6 +695,7 @@ def cmd_edit(args):
     check_rc(stdout, stderr, rc, "edit-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
 
+
 def cmd_repl(args):
     cargs = ["repl"]
     s = _resolve_session(args) or args.session
@@ -384,6 +705,7 @@ def cmd_repl(args):
     stdout, stderr, rc = run_colab(cargs, timeout=getattr(args, "timeout", 60), stdin_data=stdin_data)
     check_rc(stdout, stderr, rc, "repl-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
+
 
 def cmd_log(args):
     cargs = ["log"]
@@ -399,11 +721,12 @@ def cmd_log(args):
 
 def cmd_logs(args):
     """Tail a file on the Colab VM, with optional --follow streaming."""
+    _pre_auth_check()
     s = _resolve_session(args) or args.session
     filepath = args.filepath
     lines = getattr(args, "lines", 50) or 50
     follow = getattr(args, "follow", False)
-    
+
     if follow:
         import signal
         stop = [False]
@@ -414,13 +737,19 @@ def cmd_logs(args):
             print(f"Streaming {filepath} (Ctrl+C to stop)...")
             last_size = 0
             while not stop[0]:
-                code = f"import os\ntry:\n    size = os.path.getsize({json.dumps(filepath)})\n    if size > {last_size}:\n        with open({json.dumps(filepath)}) as f:\n            f.seek({last_size})\n            print(f.read(), end='')\n        print('\\n__SIZE__:' + str(size))\nexcept Exception as e:\n    print('__ERR__:' + str(e))"
-                cargs = ["exec"]
-                if s: cargs.extend(["-s", s])
-                cargs.extend(["--timeout", "12"])
-                stdout, stderr, rc = run_colab(cargs, timeout=15, stdin_data=code)
+                code = (
+                    "import os\ntry:\n"
+                    "    size = os.path.getsize('%s')\n"
+                    "    if size > %d:\n"
+                    "        with open('%s') as f:\n"
+                    "            f.seek(%d)\n"
+                    "            print(f.read(), end='')\n"
+                    "        print('\\n__SIZE__:' + str(size))\n"
+                    "except Exception as e:\n"
+                    "    print('__ERR__:' + str(e))"
+                ) % (filepath, last_size, filepath, last_size)
+                stdout, stderr, rc = _remote_pexec(s, code, timeout=10)
                 if rc == 0 and stdout.strip():
-                    # Split size marker from content
                     if '__SIZE__:' in stdout:
                         content, marker = stdout.rsplit('__SIZE__:', 1)
                         if content.strip():
@@ -435,12 +764,14 @@ def cmd_logs(args):
             if stop[0]:
                 print("\nStopped.")
     else:
-        code = f"import subprocess, sys\nr = subprocess.run(['tail', '-n', str({lines}), {json.dumps(filepath)}], capture_output=True, text=True)\nprint(r.stdout, end='')\nif r.stderr: print(r.stderr, end='')"
-        cargs = ["exec"]
-        if s: cargs.extend(["-s", s])
-        cargs.extend(["--timeout", "15"])
-        stdout, stderr, rc = run_colab(cargs, timeout=20, stdin_data=code)
-        check_rc(stdout, stderr, rc, "logs-failed", stdout.strip() or stderr.strip())
+        code = (
+            "import subprocess\n"
+            "r = subprocess.run(['tail', '-n', str(%d), '%s'], capture_output=True, text=True)\n"
+            "print(r.stdout, end='')\n"
+            "if r.stderr: print(r.stderr, end='')"
+        ) % (lines, filepath)
+        stdout, stderr, rc = _remote_pexec(s, code, timeout=15)
+        check_rc(stdout, "", rc, "logs-failed", stdout.strip())
         write_output(stdout, args.out, args.json)
 
 
@@ -450,26 +781,18 @@ def cmd_check(args):
     code = args.code
     if not code:
         die("check-no-code", "Provide --code with Python to test")
-    
-    cargs = ["exec"]
-    if s: cargs.extend(["-s", s])
-    t = getattr(args, "timeout", 60) or 60
-    cargs.extend(["--timeout", str(t)])
-    
     print(f"Running pre-flight check on {s or 'auto'}...")
-    stdout, stderr, rc = run_colab(cargs, timeout=t + 30, stdin_data=code)
-    
+    stdout, stderr, rc = _remote_pexec(s, code, timeout=getattr(args, "timeout", 60) or 60)
     if rc == 0:
         write_output(f"PASS:\n{stdout}", args.out, args.json, {"status": "pass"})
     else:
-        write_output(f"FAIL:\n{stdout}\n{stderr}", args.out, args.json, {"status": "fail"})
+        write_output(f"FAIL:\n{stdout}", args.out, args.json, {"status": "fail"})
+
 
 def cmd_notebook(args):
-    """Export session or execute notebook file."""
     s = _resolve_session(args) or args.session
     action = getattr(args, "nb_action", "export")
     if action == "export":
-        # Export session as .ipynb
         out = getattr(args, "output", None) or f"/tmp/{s or 'colab'}_export.ipynb"
         cargs = ["log", "-o", out]
         if s: cargs.extend(["-s", s])
@@ -477,7 +800,6 @@ def cmd_notebook(args):
         check_rc(stdout, stderr, rc, "notebook-failed", stdout.strip())
         write_output(f"Notebook exported to: {out}\n{stdout.strip()}", args.out, args.json, {"notebook_path": out})
     elif action == "execute":
-        # Execute an .ipynb file
         nb_file = getattr(args, "file", None)
         if not nb_file: die("notebook-no-file", "Specify --file NOTEBOOK.ipynb")
         cargs = ["exec", "-f", nb_file]
@@ -485,6 +807,7 @@ def cmd_notebook(args):
         stdout, stderr, rc = run_colab(cargs, timeout=120)
         check_rc(stdout, stderr, rc, "notebook-exec-failed", stdout.strip())
         write_output(stdout, args.out, args.json)
+
 
 def cmd_url(args):
     cargs = ["url"]
@@ -495,6 +818,7 @@ def cmd_url(args):
     check_rc(stdout, stderr, rc, "url-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
 
+
 def cmd_drivemount(args):
     cargs = ["drivemount"]
     s = _resolve_session(args) or args.session
@@ -504,6 +828,7 @@ def cmd_drivemount(args):
     check_rc(stdout, stderr, rc, "drivemount-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
 
+
 def cmd_auth(args):
     cargs = ["auth"]
     s = _resolve_session(args) or args.session
@@ -511,6 +836,7 @@ def cmd_auth(args):
     stdout, stderr, rc = run_colab(cargs, timeout=60)
     check_rc(stdout, stderr, rc, "auth-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
+
 
 def cmd_restart(args):
     cargs = ["restart-kernel"]
@@ -520,15 +846,18 @@ def cmd_restart(args):
     check_rc(stdout, stderr, rc, "restart-failed", stdout.strip())
     write_output(stdout, args.out, args.json)
 
+
 def cmd_pay(args):
     stdout, stderr, rc = run_colab(["pay"], timeout=10)
     check_rc(stdout, stderr, rc, "pay-failed", stdout.strip())
     write_output(stdout or "https://colab.research.google.com/signup", args.out, args.json)
 
+
 def cmd_version(args):
     stdout, stderr, rc = run_colab(["version"], timeout=5)
     check_rc(stdout, stderr, rc, "version-failed", stdout.strip())
-    write_output(stdout.strip(), args.out, args.json)
+    write_output(f"colab-cli v3.1\n{stdout.strip()}", args.out, args.json)
+
 
 def cmd_update(args):
     cargs = ["update"]
@@ -537,13 +866,15 @@ def cmd_update(args):
     check_rc(stdout, stderr, rc, "update-failed", stdout.strip())
     write_output(stdout.strip(), args.out, args.json)
 
+
 def cmd_whoami(args):
     stdout, stderr, rc = run_colab(["whoami"], timeout=10)
     if rc != 0:
         die("whoami-failed", "whoami not available. Upgrade: pip install --upgrade google-colab-cli")
     write_output(stdout.strip(), args.out, args.json)
 
-# ─── Browser-based ─────────────────────────────────────────────────────────────
+
+# ─── Browser-based ─────────────────────────────────────────────────────────
 
 def _get_browser_colab_url(session=None):
     cargs = ["url"]
@@ -554,6 +885,7 @@ def _get_browser_colab_url(session=None):
         if line.strip().startswith("http"): return line.strip()
     return None
 
+
 def cmd_secrets(args):
     action = getattr(args, "secrets_action", "list")
     key = getattr(args, "key", None)
@@ -561,15 +893,12 @@ def cmd_secrets(args):
     s = _resolve_session(args) or args.session
     if action in ("set", "get", "delete") and not key:
         die("secrets-missing-key", f"Action '{action}' requires --key")
-
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         die("secrets-no-playwright", "Install: pip install playwright && playwright install chromium")
-
     url = _get_browser_colab_url(s)
     if not url: die("secrets-no-url", "No browser URL. Session running?")
-
     result = {"ok": True, "action": action}
     pw = sync_playwright().start()
     browser = ctx = page = None
@@ -578,21 +907,24 @@ def cmd_secrets(args):
         ctx = browser.new_context(viewport={"width": 1280, "height": 800})
         page = ctx.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        time.sleep(5)
+        page.wait_for_selector('button:has-text("Secrets")', timeout=15000)
         secrets_btn = page.locator('button:has-text("Secrets")')
         if secrets_btn.count() == 0: die("secrets-not-found", "Secrets panel missing.")
-        secrets_btn.first.click(); time.sleep(2)
+        secrets_btn.first.click()
+        page.wait_for_timeout(500)
         if action == "list":
             result["secrets"] = _parse_secrets_list(page.locator("body").inner_text())
         elif action == "set":
             add_btn = page.locator('button:has-text("Add new secret")')
             if add_btn.count() > 0:
-                add_btn.first.click(); time.sleep(1)
+                add_btn.first.click()
+                page.wait_for_selector('input[placeholder*="Name"]', timeout=5000)
                 ni = page.locator('input[placeholder*="Name"]')
                 if ni.count() > 0: ni.first.fill(key)
                 vi = page.locator('input[placeholder*="Value"]')
                 if vi.count() > 0: vi.first.fill(value)
-                page.keyboard.press("Enter"); time.sleep(1)
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(500)
                 result["msg"] = f"Secret '{key}' set."
         elif action == "delete":
             result["msg"] = "Delete requires DOM interaction — use list first to identify."
@@ -606,6 +938,7 @@ def cmd_secrets(args):
         except: pass
     write_output(json.dumps(result, ensure_ascii=False), args.out, args.json)
 
+
 def _parse_secrets_list(page_text):
     secrets = []
     in_secrets = False
@@ -615,6 +948,7 @@ def _parse_secrets_list(page_text):
         if in_secrets and s == "Close": break
         if in_secrets and s and not s.startswith("Add") and not s.startswith("Secrets"): secrets.append(s)
     return secrets
+
 
 def cmd_resources(args):
     s = _resolve_session(args) or args.session
@@ -629,7 +963,7 @@ def cmd_resources(args):
                 ctx = browser.new_context(viewport={"width": 1280, "height": 800})
                 page = ctx.new_page()
                 page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                time.sleep(5)
+                page.wait_for_timeout(1000)
                 body = page.locator("body").inner_text()
                 resources = {}
                 for m in re.finditer(r'RAM:\s*([\d.]+)\s*GB\s*/\s*([\d.]+)\s*GB', body):
@@ -644,7 +978,7 @@ def cmd_resources(args):
                     write_output(json.dumps({"ok": True, "resources": resources}, ensure_ascii=False), args.out, args.json)
                     return
             finally:
-                for obj in [page, ctx, browser]: 
+                for obj in [page, ctx, browser]:
                     try: obj.close()
                     except: pass
                 try: pw.stop()
@@ -652,12 +986,14 @@ def cmd_resources(args):
     except Exception: pass
     cmd_status(args)
 
+
 def cmd_share(args):
     s = _resolve_session(args) or args.session
     url = _get_browser_colab_url(s)
     if not url: die("share-no-url", "No browser URL.")
     result = {"ok": True, "url": url, "msg": "Share this URL."}
     write_output(json.dumps(result, ensure_ascii=False), args.out, args.json)
+
 
 def cmd_tunnel(args):
     """Get or save Cloudflare tunnel URL for a session."""
@@ -680,10 +1016,11 @@ def cmd_tunnel(args):
         TUNNEL_FILE.write_text(json.dumps(data, indent=2))
         write_output(f"Tunnel URL saved for {s or 'default'}: {url}", args.out, args.json)
 
-# ─── CLI ───────────────────────────────────────────────────────────────────────
+
+# ─── CLI ───────────────────────────────────────────────────────────────────
 
 def build_parser():
-    p = argparse.ArgumentParser(description="colab-cli v2.1 — AI-agent-native CLI for Google Colab",
+    p = argparse.ArgumentParser(description="colab-cli v3.1 — AI-agent-native CLI for Google Colab",
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     shared_output = argparse.ArgumentParser(add_help=False)
     shared_output.add_argument("-o", "--out", help="Write output to FILE, stdout gets JSON pointer")
@@ -701,14 +1038,38 @@ def build_parser():
     pg = sub.add_parser("gpu_switch", parents=[shared_output], help="Switch GPU on session"); pg.add_argument("-s", "--session"); pg.add_argument("--gpu", choices=["T4","L4","G4","H100","A100"], required=True)
 
     # Execution
-    pe = sub.add_parser("exec", parents=[shared_output], help="Execute code")
+    pe = sub.add_parser("exec", parents=[shared_output], help="Execute code on VM")
     pe.add_argument("-s", "--session"); pe.add_argument("-f", "--file"); pe.add_argument("--code"); pe.add_argument("--output-image"); pe.add_argument("--timeout", type=float, default=30.0)
-    peb = sub.add_parser("exec_bg", parents=[shared_output], help="Background execution")
+
+    # NEW: exec_detach — upload + run server code detached
+    ped = sub.add_parser("exec_detach", parents=[shared_output], help="Upload script + run detached (for servers)")
+    ped.add_argument("-s", "--session", required=True, help="Colab session name")
+    ped.add_argument("-f", "--file", help="Local Python script to upload and run")
+    ped.add_argument("--code", help="Python code to upload and run (if no -f)")
+    ped.add_argument("--remote", help="Remote path (default: /content/<filename>)")
+    ped.add_argument("--log", help="Log file path on VM (default: /dev/null)")
+    ped.add_argument("--dir", default="/content", help="Working directory on VM (default: /content)")
+
+    # NEW: exec_file — upload + exec in one step
+    pef = sub.add_parser("exec_file", parents=[shared_output], help="Upload and execute a script in one step")
+    pef.add_argument("-s", "--session", required=True, help="Colab session name")
+    pef.add_argument("-f", "--file", required=True, help="Local Python script")
+    pef.add_argument("--remote", help="Remote path (default: /content/<filename>)")
+    pef.add_argument("--timeout", type=float, default=120.0, help="Script timeout in seconds")
+
+    # Fixed exec_bg
+    peb = sub.add_parser("exec_bg", parents=[shared_output], help="Background execution on VM")
     peb.add_argument("-s", "--session"); peb.add_argument("--code"); peb.add_argument("--timeout", type=float, default=600.0)
-    pep = sub.add_parser("exec_bg_poll", parents=[shared_output], help="Poll background job"); pep.add_argument("job_id")
+    pep = sub.add_parser("exec_bg_poll", parents=[shared_output], help="Poll background job"); pep.add_argument("job_id"); pep.add_argument("-s", "--session")
+
+    # Other execution
     pr2 = sub.add_parser("run", parents=[shared_output], help="Ephemeral job"); pr2.add_argument("-f", "--file"); pr2.add_argument("--code"); pr2.add_argument("--gpu", choices=["T4","L4","G4","H100","A100"]); pr2.add_argument("--tpu", choices=["v5e1","v6e1"]); pr2.add_argument("--keep", action="store_true"); pr2.add_argument("args", nargs="*")
     pr3 = sub.add_parser("repl", parents=[shared_output], help="Python REPL"); pr3.add_argument("-s", "--session"); pr3.add_argument("--code"); pr3.add_argument("--output-image"); pr3.add_argument("--timeout", type=float, default=60.0)
-    pc = sub.add_parser("console", parents=[shared_output], help="Shell command"); pc.add_argument("-s", "--session"); pc.add_argument("--cmd", help="Shell command to run"); pc.add_argument("--timeout", type=float, default=60.0)
+    pc = sub.add_parser("console", parents=[shared_output], help="Shell command on VM"); pc.add_argument("-s", "--session"); pc.add_argument("--cmd", help="Shell command to run"); pc.add_argument("--timeout", type=float, default=60.0)
+
+    # NEW: tunnel discover
+    ptd = sub.add_parser("tunnel_discover", parents=[shared_output], help="Auto-discover live tunnel URL from VM")
+    ptd.add_argument("-s", "--session", required=True, help="Colab session name")
 
     # VM file ops
     plogs = sub.add_parser("logs", parents=[shared_output], help="Tail VM file")
@@ -717,14 +1078,14 @@ def build_parser():
     plogs.add_argument("-f", "--follow", action="store_true", help="Stream output (Ctrl+C to stop)")
 
     # File ops
-    pl = sub.add_parser("ls", parents=[shared_output], help="List files"); pl.add_argument("-s", "--session"); pl.add_argument("path", nargs="?")
-    pu = sub.add_parser("upload", parents=[shared_output], help="Upload file"); pu.add_argument("-s", "--session"); pu.add_argument("local"); pu.add_argument("remote")
-    pd = sub.add_parser("download", parents=[shared_output], help="Download file"); pd.add_argument("-s", "--session"); pd.add_argument("remote"); pd.add_argument("local")
-    prm = sub.add_parser("rm", parents=[shared_output], help="Delete file"); prm.add_argument("-s", "--session"); prm.add_argument("path")
+    pl = sub.add_parser("ls", parents=[shared_output], help="List files on VM"); pl.add_argument("-s", "--session"); pl.add_argument("path", nargs="?")
+    pu = sub.add_parser("upload", parents=[shared_output], help="Upload file to VM"); pu.add_argument("-s", "--session"); pu.add_argument("local"); pu.add_argument("remote")
+    pd = sub.add_parser("download", parents=[shared_output], help="Download file from VM"); pd.add_argument("-s", "--session"); pd.add_argument("remote"); pd.add_argument("local")
+    prm = sub.add_parser("rm", parents=[shared_output], help="Delete file on VM"); prm.add_argument("-s", "--session"); prm.add_argument("path")
     pe2 = sub.add_parser("edit", parents=[shared_output], help="Edit remote file"); pe2.add_argument("-s", "--session"); pe2.add_argument("remote_path")
 
     # Automation
-    pi = sub.add_parser("install", parents=[shared_output], help="Install packages"); pi.add_argument("-s", "--session"); pi.add_argument("-r", "--requirements"); pi.add_argument("--pip-args", help="Extra pip flags"); pi.add_argument("packages", nargs="*")
+    pi = sub.add_parser("install", parents=[shared_output], help="Install packages on VM"); pi.add_argument("-s", "--session"); pi.add_argument("-r", "--requirements"); pi.add_argument("--pip-args", help="Extra pip flags"); pi.add_argument("packages", nargs="*")
     pchk = sub.add_parser("check", parents=[shared_output], help="Pre-flight model test"); pchk.add_argument("-s", "--session"); pchk.add_argument("--code", required=True, help="Python to test"); pchk.add_argument("--timeout", type=float, default=60.0)
     pl2 = sub.add_parser("log", parents=[shared_output], help="View/export history"); pl2.add_argument("-s", "--session"); pl2.add_argument("-n", "--lines", type=int); pl2.add_argument("-t", "--event-type"); pl2.add_argument("--output")
     pn2 = sub.add_parser("notebook", parents=[shared_output], help="Notebook export/execute"); pn2.add_argument("-s", "--session"); pn2.add_argument("action", nargs="?", choices=["export","execute"], default="export", help="export or execute"); pn2.add_argument("--output", help="Export path"); pn2.add_argument("--file", help="Notebook file to execute")
@@ -746,6 +1107,7 @@ def build_parser():
 
     return p
 
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -755,6 +1117,7 @@ def main():
 
     dispatcher = {
         "new": cmd_new, "exec": cmd_exec, "exec_bg": cmd_exec_bg, "exec_bg_poll": cmd_exec_bg_poll,
+        "exec_detach": cmd_exec_detach, "exec_file": cmd_exec_file,
         "run": cmd_run, "sessions": cmd_sessions, "status": cmd_status, "stop": cmd_stop,
         "gpu_switch": cmd_gpu_switch, "restart": cmd_restart,
         "ls": cmd_ls, "upload": cmd_upload, "download": cmd_download, "rm": cmd_rm,
@@ -762,12 +1125,15 @@ def main():
         "url": cmd_url, "drivemount": cmd_drivemount, "auth": cmd_auth,
         "console": cmd_console, "edit": cmd_edit, "repl": cmd_repl,
         "logs": cmd_logs, "check": cmd_check,
+        "tunnel": cmd_tunnel, "tunnel_discover": cmd_tunnel_discover,
         "pay": cmd_pay, "version": cmd_version, "update": cmd_update, "whoami": cmd_whoami,
-        "secrets": cmd_secrets, "resources": cmd_resources, "share": cmd_share, "tunnel": cmd_tunnel,
+        "secrets": cmd_secrets, "resources": cmd_resources, "share": cmd_share,
     }
     try:
         dispatcher[args.command](args)
     except KeyboardInterrupt: die("interrupted", "Cancelled")
     except Exception as e: die("exception", str(e))
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()

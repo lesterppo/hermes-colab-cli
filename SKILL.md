@@ -1,7 +1,7 @@
 ---
 name: hermes-colab-cli
-description: Operate Colab VMs and deploy SDXL models on free GPUs.
-version: 2.2.0
+description: Operate Colab VMs with colab-cli v3.1 — auto-auth, retries, exec_detach, tunnel_discover.
+version: 3.1.0
 author: Peter (lesterppo)
 license: MIT
 platforms: [linux, macos]
@@ -29,7 +29,7 @@ Operate Google Colab VMs and deploy Pony Diffusion V6 XL on free T4 GPUs.
 - Colab OAuth2 authenticated (see `references/auth_flow.md`)
 - For Pony Diffusion: `transformers==4.48.0` (not 5.x)
 
-## Colab CLI Commands (v2.2)
+## Colab CLI Commands (v3.1)
 
 ```bash
 # Session
@@ -40,22 +40,25 @@ python3 colab.py stop -s <name>
 
 # Execution
 python3 colab.py exec -s <name> --code "..." --timeout 120
+python3 colab.py exec_detach -s <name> -f script.py --log /content/deploy.log
+python3 colab.py exec_file -s <name> -f script.py
 python3 colab.py exec_bg -s <name> --code "..." --timeout 600
 python3 colab.py exec_bg_poll <job_id>
 python3 colab.py console -s <name> --cmd "nvidia-smi"
 
-# NEW: VM log streaming
+# VM log streaming
 python3 colab.py logs -s <name> <file> -n 50     # read last 50 lines
 python3 colab.py logs -s <name> <file> -f         # stream (Ctrl+C to stop)
 
-# NEW: Pre-flight model check
+# Pre-flight model check
 python3 colab.py check -s <name> --code "..." --timeout 120
 
 # Files
 python3 colab.py upload -s <name> <local> <remote>
 python3 colab.py download -s <name> <remote> <local>
 
-# Tunnel
+# Tunnel (v3.1: tunnel_discover auto-finds URLs)
+python3 colab.py tunnel_discover -s <name>
 python3 colab.py tunnel get -s <name>
 python3 colab.py tunnel set --url <url> -s <name>
 ```

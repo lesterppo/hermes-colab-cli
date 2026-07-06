@@ -1,249 +1,147 @@
-# AGENTS.md — Hermes Colab CLI + Pony Diffusion V6 XL
+# AGENTS.md — Hermes Colab CLI v3.1
 
-Instructions for AI coding assistants working with this repo: operating Google
-Colab VMs and deploying image generation models on them.
+Instructions for AI coding assistants using colab.py v3.1: operating Google
+Colab VMs and deploying models on free GPU runtimes.
 
 ## What This Is
 
-Two tools in one repo:
+**Colab CLI** (`colab.py`) — token-efficient wrapper around Google's
+`google-colab-cli`. 36 commands for session management, code execution,
+file ops, VM log streaming, tunnel discovery, and model deployment.
 
-1. **Colab CLI** (`colab.py`) — token-efficient wrapper around Google's
-   `google-colab-cli`. 33 commands for session management, code execution,
-   file ops, VM log streaming, and model pre-flight checks.
-
-2. **Pony Diffusion V6 XL** (`pony.py` + `examples/ponydiff/`) — Full
-   deployment of Pony Diffusion V6 XL (SDXL fine-tune, 6.46 GB) on Colab
-   T4 GPU. FastAPI server + Cloudflare tunnel + local CLI chatbox.
+Pony Diffusion and Z-Image-Turbo deployment scripts + local CLIs also included.
 
 ## File Structure
 
 ```
 hermes-colab-cli/
-├── colab.py              # Colab CLI wrapper (33 commands, v2.2)
-├── pony.py               # Pony Diffusion local CLI chatbox (v2.0)
+├── colab.py              # Colab CLI v3.1 (36 commands, 1139 lines)
+├── pony.py               # Pony Diffusion local CLI chatbox
+├── zimage/               # Z-Image-Turbo deploy + CLI
 ├── install.sh            # One-line installer
-├── AGENTS.md             # This file — AI agent onboarding
+├── AGENTS.md             # This file
 ├── README.md             # Human-readable overview
 ├── SKILL.md              # Hermes skill format
-├── examples/
-│   └── ponydiff/
-│       ├── server.py     # FastAPI image generation server (runs on Colab VM)
-│       └── deploy.py     # Deployment orchestrator (runs on Colab VM)
+├── examples/ponydiff/    # Pony Diff deployment scripts
 └── references/
-    └── auth_flow.md      # Definitive Colab OAuth2 auth guide
+    └── auth_flow.md      # Colab OAuth2 auth guide
 ```
 
-## How to Install and Auth
-
-### Install
+## Installation & Auth
 
 ```bash
 pip install google-colab-cli
-cp colab.py ~/.hermes/scripts/colab/colab.py
-cp pony.py ~/.local/bin/pony && chmod +x ~/.local/bin/pony
-# Or: ./install.sh
+# Then: ./install.sh
 ```
 
-### Auth (one-time)
+**Auth (one-time):** See `references/auth_flow.md`. The only reliable flow uses
+`redirect_uri=http://localhost` (no PKCE, no port). v3.1 auto-refreshes tokens
+every 5 minutes via background thread.
 
-The Google OAuth2 client is restricted — only ONE flow works reliably.
+## Colab CLI Reference (colab.py v3.1)
 
-1. Tell the user to open this URL:
-   ```
-   https://accounts.google.com/o/oauth2/auth?response_type=code&client_id=764086051850-6qr4p6gpi6hn506pt8ejuq83di341hur.apps.googleusercontent.com&redirect_uri=http://localhost&scope=openid+https://www.googleapis.com/auth/userinfo.email+https://www.googleapis.com/auth/cloud-platform+https://www.googleapis.com/auth/colaboratory+https://www.googleapis.com/auth/drive.file&access_type=offline
-   ```
-
-2. User signs in, approves all scopes.
-
-3. Browser tries to redirect to `http://localhost/?code=...` and fails (expected).
-   User copies the ENTIRE URL from the address bar.
-
-4. Agent extracts the `code` parameter and exchanges for tokens. See
-   `references/auth_flow.md` for the complete exchange script.
-
-5. Verify: `colab sessions`
-
-### Token Refresh
-
-The CLI auto-refreshes expired tokens. If refresh fails, re-run steps 1-5.
-
-## Colab CLI Reference (colab.py v2.2)
-
-### Session management
+### Session Management
 ```
-new -s <name> --gpu T4          Create GPU session
-sessions                         List all sessions
-status -s <name>                 Session status
-stop -s <name>                   Stop session
-restart -s <name>                Restart kernel
-gpu_switch -s <name> --gpu L4    Switch GPU type
+new -s NAME --gpu T4          Create GPU session
+sessions                        List all sessions
+status -s NAME                  Session status
+stop -s NAME                    Stop session (cleans tunnel URL)
+restart -s NAME                 Restart kernel
+gpu_switch -s NAME --gpu L4    Switch GPU type
 ```
 
 ### Execution
 ```
-exec -s <name> --code "..."      Execute Python code
-exec_bg -s <name> --code "..."   Background execution (with --timeout)
-exec_bg_poll <job_id>            Poll background job
-console -s <name> --cmd "..."    Run shell command
+exec -s NAME --code "..."       Execute Python inline
+exec -s NAME -f FILE            Execute from local file
+exec_detach -s NAME -f FILE     Upload + run detached (for servers!)  ← NEW
+exec_file -s NAME -f FILE       Upload + execute in one step           ← NEW
+exec_bg -s NAME --code "..."    Background execution on VM
+exec_bg_poll JOB_ID [-s NAME]   Poll background job
+console -s NAME --cmd "..."     Shell command on VM
+check -s NAME --code "..."      Pre-flight model test
 ```
 
-### VM file ops
+### File Ops
 ```
-upload -s <name> <local> <remote>  Upload file
-download -s <name> <remote> <local> Download file
-ls -s <name> [path]                List files
-logs -s <name> <file> [-n N] [-f]  Read/stream VM file (NEW v2.2)
-```
-
-### Deployment helpers
-```
-check -s <name> --code "..."       Pre-flight model import test (NEW v2.2)
-tunnel get -s <name>               Get saved tunnel URL
-tunnel set --url <url> -s <name>   Save tunnel URL
+upload -s NAME LOCAL REMOTE     Upload file
+download -s NAME REMOTE LOCAL   Download file
+ls -s NAME [PATH]               List VM files
+logs -s NAME FILE [-n N] [-f]   Tail/stream VM file
 ```
 
-## Pony Diffusion V6 XL — Full Deployment
-
-### Architecture
-
+### Tunnel & Auth
 ```
-┌──────────┐   POST /generate    ┌──────────────┐   Cloudflare    ┌──────────┐
-│  pony    │ ──────────────────→ │ FastAPI       │ ←─────────────→ │  Colab   │
-│  CLI     │ ←──── ZIP download  │ uvicorn :8000 │    tunnel      │  T4 GPU  │
-│ (local)  │                     │ server.py     │                │ (cloud)  │
-└──────────┘                     └──────────────┘                └──────────┘
+tunnel_discover -s NAME         Auto-discover live tunnel URL from VM  ← NEW
+tunnel get -s NAME              Get saved tunnel URL
+tunnel set --url URL -s NAME    Save tunnel URL
 ```
 
-### Deployment Steps
+## v3.1 Key Improvements
+
+1. **exec_detach** — THE way to launch long-running servers. Upload script,
+   runs with `start_new_session`, returns PID immediately. No more blocking.
+
+2. **tunnel_discover** — auto-greps VM for `trycloudflare.com` URLs in common
+   log locations. Auto-saves found URLs. No more manual tunnel set.
+
+3. **Retry logic** — 2 retries on transient Colab errors (502/503/timeout,
+   connection reset). Survives Colab backend flakiness.
+
+4. **Auto-refresh OAuth** — background daemon thread checks token expiry
+   every 5 min. Prevents mid-deployment auth death.
+
+5. **exec_file** — upload + execute in one command. Two round-trips collapsed
+   into one.
+
+6. **Security fixes** — shell injection in `console` fixed (json.dumps
+   escaping). `tunnel_discover` shell=True replaced with list form.
+
+## Deployment Patterns
+
+### Pattern 1: Quick LLM Deploy (exec_detach)
 
 ```bash
-# 1. Create GPU session
-python3 colab.py new -s ponydiff --gpu T4
+python3 colab.py new -s mydeploy --gpu T4
+python3 colab.py exec_detach -s mydeploy \
+    -f deploy_script.py --log /content/deploy.log
 
-# 2. CRITICAL: Downgrade transformers (Colab ships 5.x — breaks SDXL)
-python3 colab.py exec -s ponydiff --timeout 120 --code "
-import subprocess, sys
-subprocess.run([sys.executable, '-m', 'pip', 'install', 'transformers==4.48.0'], check=True)
-"
-
-# 3. Install deps on VM
-python3 colab.py exec_bg -s ponydiff --timeout 600 --code "
-import subprocess, sys
-subprocess.run([sys.executable, '-m', 'pip', 'install',
-    'diffusers[torch]', 'transformers==4.48.0', 'accelerate', 'xformers',
-    'safetensors', 'fastapi', 'uvicorn', 'python-multipart'], check=True)
-print('DEPS_OK')
-"
-
-# 4. Upload server + deploy
-python3 colab.py upload -s ponydiff examples/ponydiff/server.py /content/server.py
-python3 colab.py upload -s ponydiff examples/ponydiff/deploy.py /content/deploy.py
-
-# 5. Deploy (model download 5-8 min)
-python3 colab.py exec_bg -s ponydiff --timeout 1200 --code "
-import subprocess, sys
-subprocess.run([sys.executable, '/content/deploy.py'], check=True)
-"
-
-# 6. Monitor progress (NEW: log streaming)
-python3 colab.py logs -s ponydiff /content/deploy_output.txt -n 30
-# Or stream: python3 colab.py logs -s ponydiff /content/deploy_output.txt -f
-
-# 7. Get tunnel URL
-python3 colab.py exec -s ponydiff --code "
-import os, re
-log = open('/content/tunnel.log').read()
-urls = re.findall(r'https://[a-zA-Z0-9.-]*\.trycloudflare\.com', log)
-print(urls[0] if urls else 'NOT FOUND')
-"
-
-# 8. Configure CLI
-pony set-url <tunnel-url>
-pony test
-
-# 9. Save for persistence
-python3 colab.py tunnel set --url <tunnel-url> -s ponydiff
+# Wait for deployment, then:
+python3 colab.py tunnel_discover -s mydeploy
+# tunnel_discover auto-saves the URL
+python3 colab.py logs -s mydeploy /content/deploy.log -f
 ```
 
-### Pre-flight Check (NEW v2.2)
+### Pattern 2: Pony Diffusion (legacy)
 
-Validate model loading before full deployment (30s vs 8 min):
-
-```bash
-python3 colab.py check -s ponydiff --timeout 120 --code "
-from diffusers import StableDiffusionXLPipeline
-from huggingface_hub import hf_hub_download, list_repo_files
-files = list_repo_files('LyliaEngine/Pony_Diffusion_V6_XL')
-safetensors = [f for f in files if f.endswith('.safetensors')]
-print(f'Repo OK: {safetensors}')
-"
-```
-
-### CLI Reference (pony.py v2.0)
-
-```bash
-pony chat                    # Interactive chatbox
-pony generate "prompt" -s 20 # One-shot generation
-pony batch "prompt" --num 3  # Parallel seed variants (2 concurrent)
-pony view                    # Extract & show last generation
-pony test                    # Health check
-pony url                     # Show API URL
-pony set-url <url>           # Configure endpoint
-pony reconnect               # Health check + auto-recover URL
-pony watch -i 120            # Background health monitor + auto-reconnect
-```
-
-### Chatbox slash commands
-
-```
-/set steps N        Inference steps (15-50)
-/set cfg N          CFG scale (1.0-15.0)
-/set size W H       Output dimensions
-/set num N          Images per generation (1-4)
-/set negative TEXT  Negative prompt
-/batch PROMPT       3 seed variants in parallel
-/view               Extract & list last images
-/reconnect          Health check + auto-recovery
-/params             Show current parameters
-/stats              Generation statistics
-```
+See original steps in examples/ponydiff/. Use `exec_bg` for long downloads,
+then `logs -f` for progress monitoring.
 
 ## Output Format
 
-Images saved to `~/pony_output/<timestamp>/`:
+All commands return pointer-JSON on stdout:
+- `-o FILE`: `{"ok":true,"f":"<path>","s":<bytes>}` (~30 tokens)
+- `--json`: `{"ok":true,"text":"..."}`
+- Default: raw text (verbose)
 
-```
-~/pony_output/
-  20260705_234507/
-    pony_20260705_234507.zip   # ZIP archive
-    pony_001.png               # after extract with pony view
-```
+Error output: `{"ok":false,"err":"<code>","msg":"<message>"}` (~25 tokens)
 
-ZIP-only from the API. Generic filenames. No inline display.
+## Token Budget
+
+| Invocation | Agent tokens |
+|---|---|
+| `new -s X --gpu T4` | ~40-60 |
+| `exec_detach -s X -f Y` | ~50-80 (pointer) |
+| `tunnel_discover -s X` | ~30-80 |
+| `logs -s X FILE -n 20` | ~100-500 |
+| Error response | ~25-35 |
 
 ## Pitfalls
 
-1. **Auth URL must use `redirect_uri=http://localhost`** — no PKCE, no port,
-   no `token_usage=remote`. Other combinations fail.
-
-2. **transformers 5.x breaks SDXL from_single_file.** Colab ships 5.12 which
-   flattened CLIPTextModel. Pin to `transformers==4.48.0` before anything.
-
-3. **from_single_file needs local path, not repo ID.** Use `hf_hub_download`
-   first, then pass the local file path.
-
-4. **Model is 6.46 GB.** Download takes 5-8 min. Stream progress with
-   `colab.py logs -s ponydiff /content/deploy_output.txt -f`.
-
-5. **Colab kernel drops during server startup.** deploy.py writes output to
-   `/content/deploy_output.txt` so `logs` can read it even if exec response
-   is lost.
-
-6. **T4 GPU has 16 GB VRAM.** `enable_model_cpu_offload()` keeps SDXL at ~8 GB.
-   Without it, OOM on first generation.
-
-7. **Colab 90 min idle timeout, 24h max.** Run `pony watch -i 120` to keep
-   alive and auto-reconnect.
-
-8. **Tunnel URL changes on every session restart.** Save with `colab.py tunnel set`
-   and `pony set-url`. `pony watch` does this automatically.
+1. **Auth: redirect_uri=http://localhost only** — no PKCE, no port.
+2. **exec blocks on servers.** Use exec_detach for llama.cpp, FastAPI, tunnels.
+3. **Colab 90min idle timeout, 24h max.**
+4. **Tunnel URL changes on restart.** Use tunnel_discover.
+5. **HF Hub rate-limits unauthenticated downloads.** Always pass HF_TOKEN.
+6. **transformers 5.x breaks SDXL.** Pin to transformers==4.48.0.
+7. **GPU switch destroys session state.** Re-upload and re-deploy.
