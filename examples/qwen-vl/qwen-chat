@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""qwen-chat v2 — CLI client for Qwen2.5-VL-3B Colab server.
+
+Deploy times: ~3 min (standard), ~2 min (HF_TOKEN), ~30s (cache URL).
+Auto-reconnect: if Colab runtime died, redeploys automatically.
+Usage:
+  qwen-chat                        Interactive REPL (default)
+  qwen-chat login <url> [name]     Register endpoint
+  qwen-chat reconnect [name]       Force redeploy + reconnect
+  qwen-chat list                   List accounts
+  qwen-chat switch <name>          Set active account
+  qwen-chat chat <prompt>          One-shot text
+  qwen-chat image <path> <prompt>  One-shot image + text
+  qwen-chat status                 Server info
+  qwen-chat remove <name>          Delete account
+  qwen-chat reset                  Clear history
+  qwen-chat session <name>         Switch session
+  qwen-chat drive-link [url]       Set/view cache URL (direct download)
+  qwen-chat hf-token [token]       Set/view HuggingFace token
+
+REPL commands:
+  /image <path>     Attach image to next message
+  /reconnect        Force redeploy Colab session
+  /reset            Clear conversation
+  /status           Server info
+  /session <id>     Switch session
+  /help             Show commands
+  /quit, /exit      Exit
+"""
+
+import json, os, sys, base64, urllib.request, urllib.error
+import shutil, textwrap, subprocess, time, signal
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".qwen-cli"
+CONFIG_FILE = CONFIG_DIR / "accounts.json"
+COLABC = str(Path.home() / ".hermes/scripts/colab/colab.py")
+DEPLOY_SCRIPT = "/tmp/qwen-vl-deploy.py"
+
+# ── Terminal colors ───────────────────────────────────────────────────
+
+BOLD="\033[1m"; DIM="\033[2m"; RED="\033[31m"; GREEN="\033[32m"
+YELLOW="\033[33m"; BLUE="\033[34m"; CYAN="\033[36m"; RESET="\033[0m"
+
+def _term_width():
+    return shutil.get_terminal_size().columns
+
+def _rule(char="─", color=DIM):
+    return color + char * _term_width() + RESET
+
+# ── Config ────────────────────────────────────────────────────────────
+
+def load_config():
+    if CONFIG_FILE.exists():
+        return json.loads(Path(CONFIG_FILE).read_text())
+    return {"active": None, "accounts": {}}
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2) + "\n")
+
+def get_active(cfg):
+    name = cfg.get("active")
+    if not name:
+        die("No active account. Use: qwen-chat login <url> [name]")
+    acct = cfg["accounts"].get(name)
+    if not acct:
+        die(f"Active account '{name}' not found. Use: qwen-chat list")
+    return name, acct
+
+def die(msg):
+    print(f"\n{RED}ERROR:{RESET} {msg}", file=sys.stderr)
+    sys.exit(1)
+
+# ── Colab management ──────────────────────────────────────────────────
+
+def colab_cli(args, timeout=120):
+    """Run colab.py with given args, return (ok, stdout)."""
+    try:
+        r = subprocess.run(
+            ["python3", COLABC] + args,
+            capture_output=True, text=True, timeout=timeout
+        )
+        return r.returncode == 0, (r.stdout + r.stderr)
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except Exception as e:
+        return False, str(e)
+
+def colab_session_alive(session_name="qwen-vl"):
+    """Check if Colab session exists and is active."""
+    ok, out = colab_cli(["sessions"], timeout=15)
+    return ok and session_name in out and "READY" in out or "IDLE" in out or "Running" in out
+
+def colab_deploy(session_name="qwen-vl"):
+    """Create session, upload deploy script, wait for tunnel URL. Returns URL or None."""
+    print(f" {YELLOW}⟳{RESET} Creating Colab session with T4 GPU...")
+
+    # Step 0: Stop any existing session with same name
+    ok, out = colab_cli(["sessions"], timeout=15)
+    if ok and session_name in out:
+        print(f" {DIM}  Stopping existing '{session_name}'...{RESET}")
+        colab_cli(["stop", "-s", session_name], timeout=30)
+        time.sleep(5)
+
+    # Step 1: Create session
+    ok, out = colab_cli(["new", "--gpu", "T4", "-s", session_name], timeout=120)
+    if not ok:
+        print(f" {RED}✗{RESET} Session creation failed: {out[:200]}")
+        return None
+    print(f" {GREEN}✓{RESET} Session '{session_name}' created.")
+
+    # Step 2: Upload deploy config (DRIVE_URL, HF_TOKEN)
+    cfg = load_config()
+    deploy_cfg = {
+        "DRIVE_URL": cfg.get("drive_url", ""),
+        "HF_TOKEN": cfg.get("hf_token", ""),
+    }
+    cfg_file = CONFIG_DIR / "deploy_config.json"
+    cfg_file.write_text(json.dumps(deploy_cfg))
+    ok, out = colab_cli(["upload", "-s", session_name, str(cfg_file),
+                          "/content/deploy_config.json"], timeout=30)
+
+    # Step 3: Upload deploy script
+    ok, out = colab_cli(["exec_detach", "-s", session_name, "-f", DEPLOY_SCRIPT,
+                          "--log", "/content/deploy.log"], timeout=120)
+
+    # Step 4: Upload check script
+    check_script = "/tmp/check_deploy.py"
+    if os.path.exists(check_script):
+        colab_cli(["upload", "-s", session_name, check_script, "/content/check_deploy.py"], timeout=30)
+
+    # Step 4: Wait for tunnel URL
+    print(f" {YELLOW}⏳{RESET} Waiting for model to load (~3 min for fresh VM, ~40s for cached)...")
+    for i in range(45):  # up to 15 min
+        time.sleep(20)
+        ok, out = colab_cli(["console", "-s", session_name, "--cmd",
+                              "cat /content/api_url.txt 2>/dev/null || echo 'waiting'"], timeout=15)
+        if ok and "trycloudflare.com" in out:
+            url = out.strip().split("\n")[-1].strip()
+            if "trycloudflare.com" in url:
+                print(f" {GREEN}✓{RESET} Tunnel ready: {url}")
+                return url
+        # Show progress occasionally
+        if i % 3 == 2 and ok:
+            # Check deploy status
+            ok2, status_out = colab_cli(["console", "-s", session_name, "--cmd",
+                "cat /content/deploy_status.json 2>/dev/null || echo '{}'"], timeout=10)
+            try:
+                s = json.loads(status_out.split("\n")[0]) if status_out else {}
+                stage = s.get("stage", "unknown")
+                detail = s.get("detail", "")[:60]
+                if stage not in ("ready", "running"):
+                    print(f" {DIM}  Stage: {stage} — {detail}{RESET}")
+            except: pass
+
+    # Check what went wrong
+    ok, log = colab_cli(["console", "-s", session_name, "--cmd",
+                          "tail -20 /content/deploy.log 2>/dev/null"], timeout=10)
+    print(f" {RED}✗{RESET} Tunnel not ready after 15 min.")
+    print(f" {DIM}Last log:{RESET}\n{log[:500]}")
+    return None
+
+# ── API call with auto-reconnect ──────────────────────────────────────
+
+def api_call(url, endpoint, data=None, method="POST", retry=True):
+    """Make HTTP request. On connection failure, attempt auto-reconnect once."""
+    full_url = f"{url.rstrip('/')}/{endpoint.lstrip('/')}"
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(full_url, data=body, method=method)
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        raise ConnectionError(f"Server error {e.code}: {body_text[:300]}")
+    except (urllib.error.URLError, OSError, ConnectionError) as e:
+        if not retry:
+            raise ConnectionError(f"Connection failed: {e}")
+        # Auto-reconnect
+        return _auto_reconnect_and_retry(url, endpoint, data, method)
+
+def _auto_reconnect_and_retry(url, endpoint, data, method):
+    """Attempt to redeploy and retry the request."""
+    cfg = load_config()
+    name = cfg.get("active")
+    if not name:
+        raise ConnectionError("No active account — cannot auto-reconnect.")
+
+    print(f"\n {YELLOW}⟳ Connection lost. Auto-reconnecting...{RESET}")
+
+    new_url = colab_deploy("qwen-vl")
+    if not new_url:
+        raise ConnectionError("Auto-reconnect failed. Run: qwen-chat reconnect")
+
+    # Update config
+    cfg["accounts"][name]["url"] = new_url
+    save_config(cfg)
+    print(f" {GREEN}✓{RESET} Reconnected. New endpoint: {new_url}")
+
+    # Retry the original request (no more retries to avoid infinite loops)
+    return api_call(new_url, endpoint, data, method, retry=False)
+
+def health_check(url):
+    """Quick health check. Returns (ok, info_dict)."""
+    try:
+        info = api_call(url, "/health", method="GET", retry=False)
+        return True, info
+    except Exception as e:
+        return False, {"error": str(e)}
+
+# ── Session helpers ───────────────────────────────────────────────────
+
+def _get_session(account_name):
+    sf = CONFIG_DIR / f"session_{account_name}.txt"
+    return sf.read_text().strip() if sf.exists() else "default"
+
+def _save_session(account_name, session_name):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    (CONFIG_DIR / f"session_{account_name}.txt").write_text(session_name)
+
+def _now():
+    from datetime import datetime
+    return datetime.now().strftime("%Y-%m-%d")
+
+def encode_image(path):
+    if not os.path.exists(path):
+        return None, f"Image not found: {path}"
+    with open(path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
+    ext = os.path.splitext(path)[1].lower()
+    mime_map = {".jpg":"jpeg", ".jpeg":"jpeg", ".png":"png",
+                ".webp":"webp", ".gif":"gif", ".bmp":"bmp"}
+    return f"data:image/{mime_map.get(ext, 'jpeg')};base64,{data}", None
+
+# ═══════════════════════════════════════════════════════════════════════
+# REPL
+# ═══════════════════════════════════════════════════════════════════════
+
+def cmd_repl(args):
+    cfg = load_config()
+    name, acct = get_active(cfg)
+    sid = _get_session(name)
+
+    # Pre-flight health check with auto-reconnect
+    ok, health = health_check(acct["url"])
+    if not ok:
+        print(f" {YELLOW}Server unreachable — attempting auto-reconnect...{RESET}")
+        new_url = colab_deploy("qwen-vl")
+        if new_url:
+            cfg["accounts"][name]["url"] = new_url
+            save_config(cfg)
+            acct["url"] = new_url
+            ok, health = health_check(new_url)
+        if not ok:
+            die(f"Cannot reach server. Run: qwen-chat reconnect\n  {health.get('error', '')}")
+
+    # Banner
+    print()
+    print(_rule("═"))
+    print(f" {BOLD}Qwen Chat{RESET}  {DIM}— {health.get('model', '?')}{RESET}")
+    print(f" {DIM}Account:{RESET} {name}  {DIM}Session:{RESET} {sid}  "
+          f"{DIM}VRAM:{RESET} {health.get('vram_gb', '?')} GB  "
+          f"{DIM}Uptime:{RESET} {health.get('uptime_s', 0)//60}m")
+    print(_rule("═"))
+    print(f" {DIM}Chat away. /image <path>  /help  /quit{RESET}")
+    print()
+
+    pending_image = None
+    history = []
+
+    def on_sigint(sig, frame):
+        print(f"\n{YELLOW}Interrupted. /quit to exit.{RESET}")
+    prev_handler = signal.signal(signal.SIGINT, on_sigint)
+
+    try:
+        while True:
+            prompt = f"{CYAN}🖼 {os.path.basename(pending_image)} ▸{RESET} " if pending_image else f"{CYAN}▸{RESET} "
+
+            try:
+                line = input(prompt)
+            except EOFError:
+                print()
+                break
+
+            line = line.strip()
+            if not line:
+                continue
+
+            # ── /commands ──────────────────────────────────────────
+            if line.startswith("/"):
+                parts = line.split(maxsplit=1)
+                cmd = parts[0].lower()
+                arg = parts[1] if len(parts) > 1 else ""
+
+                if cmd in ("/quit", "/exit", "/q"):
+                    break
+
+                elif cmd == "/help":
+                    print(f"\n {BOLD}Commands{RESET}")
+                    print(f" {DIM}{'─'*40}{RESET}")
+                    for c, d in [
+                        ("/image <path>","Attach image to next message"),
+                        ("/reconnect",   "Force redeploy Colab session"),
+                        ("/reset",       "Clear conversation history"),
+                        ("/status",      "Show server info"),
+                        ("/session <id>","Switch session"),
+                        ("/help",        "Show this"),
+                        ("/quit",        "Exit"),
+                    ]:
+                        print(f" {CYAN}{c:<16}{RESET} {d}")
+                    print()
+
+                elif cmd == "/image":
+                    if not arg:
+                        print(f" {RED}Usage:{RESET} /image <path>")
+                        continue
+                    img_path = os.path.expanduser(arg)
+                    b64, err = encode_image(img_path)
+                    if err:
+                        print(f" {RED}{err}{RESET}")
+                        continue
+                    pending_image = img_path
+                    size_mb = os.path.getsize(img_path) / 1e6
+                    print(f" {GREEN}✓{RESET} {os.path.basename(img_path)} ({size_mb:.1f}MB) attached. Type prompt.")
+
+                elif cmd == "/reconnect":
+                    print(f" {YELLOW}⟳{RESET} Force reconnecting...")
+                    new_url = colab_deploy("qwen-vl")
+                    if new_url:
+                        cfg["accounts"][name]["url"] = new_url
+                        save_config(cfg)
+                        acct["url"] = new_url
+                        print(f" {GREEN}✓{RESET} Reconnected: {new_url}")
+                    else:
+                        print(f" {RED}✗{RESET} Reconnect failed.")
+
+                elif cmd == "/reset":
+                    try:
+                        api_call(acct["url"], f"/reset?session_id={sid}", method="POST")
+                    except: pass
+                    history = []
+                    pending_image = None
+                    print(f" {GREEN}✓{RESET} Cleared.")
+
+                elif cmd == "/status":
+                    ok, h = health_check(acct["url"])
+                    if ok:
+                        print(f" {DIM}Model:{RESET}   {h.get('model','?')}")
+                        print(f" {DIM}VRAM:{RESET}    {h.get('vram_gb','?')} GB")
+                        print(f" {DIM}Uptime:{RESET}  {h.get('uptime_s',0)//60}m")
+                        print(f" {DIM}Session:{RESET} {sid}  {DIM}Turns:{RESET} {len(history)//2}")
+                    else:
+                        print(f" {RED}Offline:{RESET} {h.get('error','?')}")
+
+                elif cmd == "/session":
+                    if not arg:
+                        print(f" {DIM}Session:{RESET} {sid}")
+                        continue
+                    _save_session(name, arg)
+                    sid = arg
+                    history = []
+                    pending_image = None
+                    print(f" {GREEN}✓{RESET} Session '{sid}'.")
+
+                else:
+                    print(f" {RED}?{RESET} {cmd}. /help for commands.")
+                continue
+
+            # ── Send to model ──────────────────────────────────────
+            images_b64 = None
+            image_label = ""
+            if pending_image:
+                b64, _ = encode_image(pending_image)
+                images_b64 = [b64]
+                image_label = f" {DIM}[{os.path.basename(pending_image)}]{RESET}"
+                pending_image = None
+
+            print(f"\n {CYAN}{BOLD}You:{RESET}{image_label} {line}")
+            print(f" {DIM}{'─' * min(_term_width()-2, 60)}{RESET}")
+            print(f" {DIM}⏳{RESET}", end="\r", flush=True)
+
+            try:
+                resp = api_call(acct["url"], "/chat", {
+                    "text": line, "images": images_b64,
+                    "session_id": sid, "max_tokens": 1024, "temperature": 0.7,
+                })
+            except ConnectionError as e:
+                print(f"\n {RED}✗{RESET} {e}")
+                continue
+            except Exception as e:
+                print(f"\n {RED}✗{RESET} {e}")
+                continue
+
+            response_text = resp["response"]
+            width = _term_width() - 2
+            wrapped = textwrap.fill(response_text, width=width)
+
+            print(f" {GREEN}{BOLD}Qwen:{RESET}")
+            for line_out in wrapped.split("\n"):
+                print(f" {line_out}")
+            print()
+
+            history.append(("user", line, pending_image))
+            history.append(("assistant", response_text, None))
+
+    except KeyboardInterrupt:
+        print()
+    finally:
+        signal.signal(signal.SIGINT, prev_handler)
+        print(f"\n {DIM}Session '{sid}' saved. Resume: qwen-chat{RESET}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# One-shot commands
+# ═══════════════════════════════════════════════════════════════════════
+
+def cmd_login(args):
+    if len(args) < 1:
+        die("Usage: qwen-chat login <url> [name]")
+    url = args[0].rstrip("/")
+    name = args[1] if len(args) > 1 else "default"
+
+    print(f"Testing {url}...")
+    ok, health = health_check(url)
+    if not ok:
+        die(f"Cannot reach server: {health.get('error', url)}")
+    print(f"  Model: {health.get('model','?')}  VRAM: {health.get('vram_gb','?')} GB  Status: ok")
+
+    cfg = load_config()
+    cfg["accounts"][name] = {"url": url, "added": _now()}
+    if cfg["active"] is None:
+        cfg["active"] = name
+    save_config(cfg)
+    print(f"Account '{name}' saved. Active: {cfg['active']}")
+    _save_session(name, "default")
+
+def cmd_reconnect(args):
+    """Force redeploy + reconnect."""
+    cfg = load_config()
+    name = cfg.get("active", "default")
+    print(f"Redeploying for '{name}'...")
+    new_url = colab_deploy("qwen-vl")
+    if new_url:
+        cfg["accounts"][name] = {"url": new_url, "added": _now()}
+        cfg["active"] = name
+        save_config(cfg)
+        print(f"Done. Active: {name} → {new_url}")
+    else:
+        die("Redeploy failed. Check Colab quota / auth.")
+
+def cmd_list(args):
+    cfg = load_config()
+    if not cfg["accounts"]:
+        print("No accounts. Use: qwen-chat login <url> [name]")
+        return
+    active = cfg.get("active","")
+    for name, acct in cfg["accounts"].items():
+        marker = f"{GREEN} *{RESET}" if name == active else "  "
+        print(f"{marker} {name}: {acct['url']}  {DIM}({acct.get('added','?')}){RESET}")
+
+def cmd_switch(args):
+    if len(args) < 1: die("Usage: qwen-chat switch <name>")
+    name = args[0]
+    cfg = load_config()
+    if name not in cfg["accounts"]: die(f"Account '{name}' not found.")
+    cfg["active"] = name
+    save_config(cfg)
+    print(f"Active: {name} → {cfg['accounts'][name]['url']}")
+
+def cmd_chat(args):
+    if len(args) < 1: die("Usage: qwen-chat chat <prompt>")
+    text = " ".join(args)
+    cfg = load_config()
+    name, acct = get_active(cfg)
+    sid = _get_session(name)
+    print(f"{DIM}[{name}]{RESET} ", end="", flush=True)
+    resp = api_call(acct["url"], "/chat", {
+        "text": text, "session_id": sid, "max_tokens": 512, "temperature": 0.7
+    })
+    print(resp["response"])
+
+def cmd_image(args):
+    if len(args) < 2: die("Usage: qwen-chat image <path> <prompt>")
+    image_path = os.path.expanduser(args[0])
+    b64, err = encode_image(image_path)
+    if err: die(err)
+    cfg = load_config()
+    name, acct = get_active(cfg)
+    sid = _get_session(name)
+    print(f"{DIM}[{name} + {os.path.basename(image_path)}]{RESET} ", end="", flush=True)
+    resp = api_call(acct["url"], "/chat", {
+        "text": " ".join(args[1:]), "images": [b64],
+        "session_id": sid, "max_tokens": 512, "temperature": 0.7
+    })
+    print(resp["response"])
+
+def cmd_status(args):
+    cfg = load_config()
+    name, acct = get_active(cfg)
+    ok, h = health_check(acct["url"])
+    print(f"Account:  {name}")
+    print(f"URL:      {acct['url']}")
+    if ok:
+        print(f"Model:    {h.get('model','?')}")
+        print(f"VRAM:     {h.get('vram_gb','?')} GB")
+        print(f"Uptime:   {h.get('uptime_s',0)//60}m")
+        print(f"Sessions: {h.get('active_sessions','?')}")
+        print(f"Session:  {_get_session(name)}")
+    else:
+        print(f"Status:   {RED}OFFLINE{RESET} — {h.get('error','?')}")
+
+def cmd_remove(args):
+    if len(args) < 1: die("Usage: qwen-chat remove <name>")
+    name = args[0]
+    cfg = load_config()
+    if name not in cfg["accounts"]: die(f"'{name}' not found.")
+    del cfg["accounts"][name]
+    if cfg["active"] == name:
+        cfg["active"] = next(iter(cfg["accounts"]), None)
+    save_config(cfg)
+    print(f"Removed '{name}'. Active: {cfg['active'] or '(none)'}")
+
+def cmd_reset(args):
+    cfg = load_config()
+    name, acct = get_active(cfg)
+    sid = _get_session(name)
+    api_call(acct["url"], f"/reset?session_id={sid}", method="POST")
+    print(f"Session '{sid}' cleared.")
+
+def cmd_session(args):
+    cfg = load_config()
+    if len(args) < 1:
+        name = cfg.get("active","none")
+        print(f"Account: {name}  Session: {_get_session(name) if name!='none' else 'N/A'}")
+        return
+    active = cfg.get("active","default")
+    _save_session(active, args[0])
+    print(f"Session for '{active}': {args[0]}")
+
+def cmd_help(args):
+    print(__doc__.strip())
+
+def cmd_drive_link(args):
+    """Set model cache URL for fast redeploys (~30s vs ~3min).
+
+    URL must be a DIRECT download link (not a file-host download page).
+    Works with: Google Drive share links (gdown), any direct HTTP tar.gz URL.
+    Does NOT work with: gofile.io download pages, any JS-required file hosts.
+
+    To create a cache manually:
+      1. Download model once on Colab (creates /content/qwen-vl-cache.tar.gz)
+      2. Upload to any direct-download host
+      3. Set URL here: qwen-chat drive-link <url>
+
+    Recommended: Use HF_TOKEN instead (free, no hosting needed):
+      qwen-chat hf-token <token>
+    """
+    if len(args) < 1:
+        cfg = load_config()
+        link = cfg.get("drive_url", "")
+        if link:
+            print(f"Cache URL: {link}")
+        else:
+            print("No cache URL configured.")
+            print()
+            print("Options for faster deploys:")
+            print(f"  1. {BOLD}HF_TOKEN{RESET} (recommended): qwen-chat hf-token <token>")
+            print(f"     Get free token: https://huggingface.co/settings/tokens")
+            print(f"  2. Cache URL: qwen-chat drive-link <direct-download-url>")
+            print(f"     Host model cache tar.gz on any direct-download server")
+        return
+    cfg = load_config()
+    cfg["drive_url"] = args[0]
+    save_config(cfg)
+    print(f"Cache URL saved. Next reconnect will use it (if direct-download).")
+    if "gofile.io/d/" in args[0]:
+        print(f"{YELLOW}WARNING:{RESET} gofile.io download pages require JS. May not work.")
+        print(f"  Use a direct download URL instead, or set HF_TOKEN.")
+
+def cmd_hf_token(args):
+    """Set HuggingFace token for fast authenticated downloads."""
+    if len(args) < 1:
+        cfg = load_config()
+        token = cfg.get("hf_token", "")
+        if token:
+            print(f"HF_TOKEN: {token[:8]}...{token[-4:] if len(token) > 12 else ''}")
+        else:
+            print("No HF_TOKEN configured.")
+            print("Get one at: https://huggingface.co/settings/tokens")
+            print("Then: qwen-chat hf-token <token>")
+        return
+    cfg = load_config()
+    cfg["hf_token"] = args[0]
+    save_config(cfg)
+    print(f"HF_TOKEN saved. Redeploys will use authenticated downloads (~5x faster).")
+
+# ── Dispatch ──────────────────────────────────────────────────────────
+
+COMMANDS = {
+    "login": cmd_login, "reconnect": cmd_reconnect, "list": cmd_list,
+    "switch": cmd_switch, "chat": cmd_chat, "image": cmd_image,
+    "status": cmd_status, "remove": cmd_remove, "reset": cmd_reset,
+    "session": cmd_session, "repl": cmd_repl,
+    "drive-link": cmd_drive_link, "hf-token": cmd_hf_token,
+    "help": cmd_help, "-h": cmd_help, "--help": cmd_help,
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        cmd_repl([])
+    else:
+        cmd = sys.argv[1]
+        if cmd in COMMANDS:
+            COMMANDS[cmd](sys.argv[2:])
+        else:
+            print(f"Unknown: {cmd}. Available: {', '.join(COMMANDS.keys())}", file=sys.stderr)
+            sys.exit(1)

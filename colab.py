@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""colab-cli v3.1 — AI-agent-native CLI for Google Colab.
+"""colab-cli v3.2 — AI-agent-native CLI for Google Colab.
 
 Fixes over v3.0:
 - P0: Retry logic for transient Colab errors (502/503/timeout), up to 2 retries
@@ -856,7 +856,7 @@ def cmd_pay(args):
 def cmd_version(args):
     stdout, stderr, rc = run_colab(["version"], timeout=5)
     check_rc(stdout, stderr, rc, "version-failed", stdout.strip())
-    write_output(f"colab-cli v3.1\n{stdout.strip()}", args.out, args.json)
+    write_output(f"colab-cli v3.2\n{stdout.strip()}", args.out, args.json)
 
 
 def cmd_update(args):
@@ -1020,7 +1020,7 @@ def cmd_tunnel(args):
 # ─── CLI ───────────────────────────────────────────────────────────────────
 
 def build_parser():
-    p = argparse.ArgumentParser(description="colab-cli v3.1 — AI-agent-native CLI for Google Colab",
+    p = argparse.ArgumentParser(description="colab-cli v3.2 — AI-agent-native CLI for Google Colab",
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     shared_output = argparse.ArgumentParser(add_help=False)
     shared_output.add_argument("-o", "--out", help="Write output to FILE, stdout gets JSON pointer")

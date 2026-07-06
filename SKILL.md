@@ -1,20 +1,20 @@
 ---
 name: hermes-colab-cli
-description: Operate Colab VMs with colab-cli v3.1 — auto-auth, retries, exec_detach, tunnel_discover.
-version: 3.1.0
+description: Operate Colab VMs with colab-cli v3.2 — auto-auth, retries, exec_detach, tunnel_discover, Qwen-VL deployment.
+version: 3.2.0
 author: Peter (lesterppo)
 license: MIT
 platforms: [linux, macos]
 metadata:
   hermes:
-    tags: [colab, cloud, gpu, diffusion, image-generation]
+    tags: [colab, cloud, gpu, diffusion, image-generation, vision-language, qwen]
     category: devops
-    related_skills: [deploy-llm-to-colab, pony-diffusion-colab]
+    related_skills: [deploy-llm-to-colab, pony-diffusion-colab, qwen-vl-colab]
 ---
 
-# Hermes Colab CLI + Pony Diffusion Skill
+# Hermes Colab CLI v3.2 — Colab Management + Model Deployments
 
-Operate Google Colab VMs and deploy Pony Diffusion V6 XL on free T4 GPUs.
+Operate Google Colab VMs, deploy Pony Diffusion V6 XL, and deploy Qwen2.5-VL-3B-Instruct on free T4 GPUs.
 
 ## When to Use
 
@@ -29,7 +29,7 @@ Operate Google Colab VMs and deploy Pony Diffusion V6 XL on free T4 GPUs.
 - Colab OAuth2 authenticated (see `references/auth_flow.md`)
 - For Pony Diffusion: `transformers==4.48.0` (not 5.x)
 
-## Colab CLI Commands (v3.1)
+## Colab CLI Commands (v3.2)
 
 ```bash
 # Session
@@ -125,12 +125,84 @@ print('Imports OK')
 "
 ```
 
+## Qwen2.5-VL-3B-Instruct Deployment (v3.2 NEW)
+
+Vision-language model (3B params, 4-bit quantized, ~2.4GB VRAM) on Colab T4.
+
+### Quick Deploy
+
+```bash
+# Install CLI
+cp examples/qwen-vl/qwen-chat ~/.local/bin/qwen-chat
+chmod +x ~/.local/bin/qwen-chat
+
+# Deploy
+qwen-chat reconnect
+
+# Chat (interactive REPL with multi-turn memory)
+qwen-chat
+
+# One-shot with image
+qwen-chat image photo.jpg "Describe this image"
+```
+
+### Deploy Times
+
+| Method | Time | Setup |
+|---|---|---|
+| HF_TOKEN | ~2 min | `qwen-chat hf-token <token>` |
+| Standard (hf_transfer) | ~3 min | None |
+| Cache URL (direct download) | ~30s | Host tar.gz on HTTP server |
+
+### Qwen Chat CLI Commands
+
+```bash
+qwen-chat                          # Interactive REPL (default)
+qwen-chat reconnect                # Force redeploy + reconnect
+qwen-chat login <url> [name]       # Register endpoint (multi-account)
+qwen-chat list                     # List accounts
+qwen-chat switch <name>            # Set active account
+qwen-chat chat <prompt>            # One-shot text
+qwen-chat image <path> <prompt>    # One-shot image + text
+qwen-chat status                   # Server info + health
+qwen-chat hf-token [token]         # Set/view HF token for fast deploys
+qwen-chat drive-link [url]         # Set/view direct cache URL
+```
+
+### REPL Commands
+
+- `/image <path>` — attach image to next message
+- `/reconnect` — force redeploy Colab session
+- `/reset` — clear conversation history
+- `/status` — show server info
+- `/session <id>` — switch conversation session
+- `/help`, `/quit`
+
+### Auto-Reconnect
+
+If Colab runtime expires (90 min idle), qwen-chat auto-detects connection failure,
+creates new session, redeploys, and retries the failed request. Transparent to user.
+
+### Server Watchdog
+
+The deploy script includes a cloudflared watchdog that auto-restarts the tunnel
+if it dies and extracts the new URL.
+
 ## Pitfalls
 
+### Colab
 1. **Auth: redirect_uri=http://localhost only** — no PKCE, no port
-2. **transformers 5.x breaks SDXL** — pin to 4.48.0
-3. **from_single_file needs local path** — use hf_hub_download first
-4. **Model 6.46 GB** — 5-8 min download, stream with `logs -f`
-5. **Kernel drops during deploy** — output saved to deploy_output.txt
-6. **Colab 90min idle timeout** — run `pony watch`
-7. **Tunnel URL changes on restart** — `pony watch` auto-updates
+2. **Colab 90min idle timeout, 24h max runtime.**
+3. **Tunnel URL changes on restart** — tunnel_discover or watchdog handles this.
+
+### Pony Diffusion
+4. **transformers 5.x breaks SDXL** — pin to 4.48.0
+5. **from_single_file needs local path** — use hf_hub_download first
+6. **Model 6.46 GB** — 5-8 min download, stream with `logs -f`
+7. **Kernel drops during deploy** — output saved to deploy_output.txt
+
+### Qwen-VL
+8. **gofile.io download pages require JS** — cannot be used as cache URLs.
+   Use direct-download URLs or HF_TOKEN for reliable fast deploys.
+9. **hf_transfer package required** — deploy script auto-installs it.
+10. **4-bit quantization uses ~2.4GB VRAM** — leaves headroom on T4.

@@ -1,14 +1,14 @@
-# Hermes Colab CLI v3.1
+# Hermes Colab CLI v3.2
 
 Token-efficient CLI for Google Colab GPU runtimes with automatic auth refresh,
 retry logic, and server deployment support.
 
 ## What's Included
 
-### Colab CLI (colab.py v3.1)
+### Colab CLI (colab.py v3.2)
 36 commands for Colab session management with pointer-JSON output.
 
-**v3.1 highlights:**
+**v3.1 highlights (carried forward):**
 - **exec_detach** — upload script + run detached for long-running servers
 - **tunnel_discover** — auto-grep VM for live Cloudflare tunnel URLs
 - **Auto-refresh OAuth** — background thread prevents mid-deployment auth death
@@ -16,6 +16,15 @@ retry logic, and server deployment support.
 - **exec_file** — upload + execute in one step
 - **exec_bg + exec_bg_poll** — proper background job tracking
 - **logs -f** — stream VM files in real time
+
+### Qwen2.5-VL-3B-Instruct (examples/qwen-vl/) — v3.2 NEW
+Deploy vision-language model on Colab T4:
+- FastAPI chat server with multi-turn memory + image support
+- Cloudflare tunnel with auto-restart watchdog
+- Interactive CLI (`qwen-chat`) with REPL, one-shot, auto-reconnect
+- Multi-account support (multiple Colab accounts = multiple endpoints)
+- 3-tier model acquisition: cache URL → HF_TOKEN → standard hf_transfer
+- See `examples/qwen-vl/README.md` for setup
 
 ### Z-Image-Turbo (zimage/)
 Deploy Alibaba Tongyi-MAI Z-Image-Turbo (6B) on Colab T4:
@@ -90,13 +99,15 @@ All commands output pointer-JSON by default. Use `-o FILE` for file output,
 ## File Structure
 
 ```
-├── colab.py              Colab CLI v3.1 (36 commands, 1139 lines)
+├── colab.py              Colab CLI v3.2 (36 commands, 1139 lines)
 ├── pony.py               Pony Diffusion local CLI
 ├── install.sh            One-command installer
 ├── AGENTS.md             AI agent guide
 ├── SKILL.md              Hermes skill format
 ├── zimage/               Z-Image-Turbo deploy + CLI
-├── examples/ponydiff/    Pony Diff deployment scripts
+├── examples/
+│   ├── ponydiff/         Pony Diff deployment scripts
+│   └── qwen-vl/          Qwen2.5-VL-3B deploy + CLI (v3.2 NEW)
 └── references/
     └── auth_flow.md      Colab OAuth2 auth guide
 ```

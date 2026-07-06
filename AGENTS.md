@@ -1,6 +1,6 @@
-# AGENTS.md — Hermes Colab CLI v3.1
+# AGENTS.md — Hermes Colab CLI v3.2
 
-Instructions for AI coding assistants using colab.py v3.1: operating Google
+Instructions for AI coding assistants using colab.py v3.2: operating Google
 Colab VMs and deploying models on free GPU runtimes.
 
 ## What This Is
@@ -9,20 +9,22 @@ Colab VMs and deploying models on free GPU runtimes.
 `google-colab-cli`. 36 commands for session management, code execution,
 file ops, VM log streaming, tunnel discovery, and model deployment.
 
-Pony Diffusion and Z-Image-Turbo deployment scripts + local CLIs also included.
+Pony Diffusion, Z-Image-Turbo, and Qwen2.5-VL-3B deployment scripts + local CLIs included.
 
 ## File Structure
 
 ```
 hermes-colab-cli/
-├── colab.py              # Colab CLI v3.1 (36 commands, 1139 lines)
+├── colab.py              # Colab CLI v3.2 (36 commands, 1139 lines)
 ├── pony.py               # Pony Diffusion local CLI chatbox
 ├── zimage/               # Z-Image-Turbo deploy + CLI
 ├── install.sh            # One-line installer
 ├── AGENTS.md             # This file
 ├── README.md             # Human-readable overview
 ├── SKILL.md              # Hermes skill format
-├── examples/ponydiff/    # Pony Diff deployment scripts
+├── examples/
+│   ├── ponydiff/         # Pony Diff deployment scripts
+│   └── qwen-vl/          # Qwen2.5-VL-3B deployment + CLI (v3.2 NEW)
 └── references/
     └── auth_flow.md      # Colab OAuth2 auth guide
 ```
@@ -38,7 +40,7 @@ pip install google-colab-cli
 `redirect_uri=http://localhost` (no PKCE, no port). v3.1 auto-refreshes tokens
 every 5 minutes via background thread.
 
-## Colab CLI Reference (colab.py v3.1)
+## Colab CLI Reference (colab.py v3.2)
 
 ### Session Management
 ```
@@ -117,6 +119,53 @@ python3 colab.py logs -s mydeploy /content/deploy.log -f
 See original steps in examples/ponydiff/. Use `exec_bg` for long downloads,
 then `logs -f` for progress monitoring.
 
+### Pattern 3: Qwen2.5-VL-3B Deploy (v3.2 NEW)
+
+Vision-language model on Colab T4. Uses exec_detach with deploy_config.json.
+
+```bash
+# 1. Create session + deploy
+python3 colab.py new -s qwen-vl --gpu T4
+# Write deploy config (DRIVE_URL and HF_TOKEN optional)
+echo '{"DRIVE_URL":"","HF_TOKEN":""}' > /tmp/deploy_config.json
+python3 colab.py upload -s qwen-vl /tmp/deploy_config.json /content/deploy_config.json
+# Deploy (detached — runs server + tunnel)
+python3 colab.py exec_detach -s qwen-vl \
+    -f examples/qwen-vl/deploy.py --log /content/deploy.log
+
+# 2. Wait for tunnel
+python3 colab.py tunnel_discover -s qwen-vl
+# Or monitor deploy progress:
+python3 colab.py logs -s qwen-vl /content/deploy.log -f
+
+# 3. Register with CLI
+qwen-chat login <tunnel-url> my-qwen
+qwen-chat  # start chatting
+```
+
+**Deploy config** (`/content/deploy_config.json` on VM):
+```json
+{"DRIVE_URL": "", "HF_TOKEN": ""}
+```
+- `DRIVE_URL`: Direct download URL for pre-built model cache tar.gz
+- `HF_TOKEN`: HuggingFace token for authenticated fast download
+
+**Model loading priority:**
+1. DRIVE_URL → download + extract cached tar.gz (~30s)
+2. HF_TOKEN → authenticated hf_transfer download (~2 min)
+3. Standard → public hf_transfer download (~3 min)
+
+**Server endpoints:**
+- `POST /chat` — `{"text":"...", "images":[...], "session_id":"...", "max_tokens":512}`
+- `POST /reset?session_id=default`
+- `GET /health` — VRAM, uptime, active sessions, cache method
+
+**qwen-chat key behaviors:**
+- Auto-reconnect on connection failure (creates new session, redeploys, retries)
+- Health pre-flight before REPL starts
+- Multi-account support for multiple Colab accounts
+- Multi-session support for isolated conversations
+
 ## Output Format
 
 All commands return pointer-JSON on stdout:
@@ -145,3 +194,9 @@ Error output: `{"ok":false,"err":"<code>","msg":"<message>"}` (~25 tokens)
 5. **HF Hub rate-limits unauthenticated downloads.** Always pass HF_TOKEN.
 6. **transformers 5.x breaks SDXL.** Pin to transformers==4.48.0.
 7. **GPU switch destroys session state.** Re-upload and re-deploy.
+8. **gofile.io download pages require JS** — cannot be used as direct download
+   URLs for Qwen-VL cache. Use HF_TOKEN instead (~2 min deploy).
+9. **exec_detach returns no output** — check /content/deploy_status.json or
+   deploy log for progress.
+10. **Colab OAuth token at `~/.config/colab-cli/token.json`** — auto-refreshed
+    by background thread every 5 min.
