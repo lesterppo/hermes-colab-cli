@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hermes Colab CLI + Pony Diffusion V6 XL — one-command installer
+# Hermes Colab CLI + Pony Diffusion V6 XL + Z-Image-Turbo — one-command installer
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -8,12 +8,11 @@ BIN_DIR="$HOME/.local/bin"
 
 mkdir -p "$COLAB_DEST" "$BIN_DIR"
 
-echo "=== Hermes Colab CLI + Pony Diffusion Installer ==="
+echo "=== Hermes Colab CLI + Diffusion Models Installer ==="
 
 # Python deps
 echo "Installing Python dependencies..."
-pip install --quiet google-colab-cli diffusers[torch] "transformers==4.48.0" \
-    accelerate xformers safetensors fastapi uvicorn python-multipart
+pip install --quiet google-colab-cli requests
 
 # Colab CLI
 cp "$SCRIPT_DIR/colab.py" "$COLAB_DEST/colab.py"
@@ -24,11 +23,17 @@ ln -sf "$COLAB_DEST/colab.py" "$BIN_DIR/colabctl"
 cp "$SCRIPT_DIR/pony.py" "$BIN_DIR/pony"
 chmod +x "$BIN_DIR/pony"
 
+# Z-Image CLI
+cp "$SCRIPT_DIR/zimage/zimage.py" "$BIN_DIR/zimage"
+chmod +x "$BIN_DIR/zimage"
+
 echo ""
 echo "=== Done ==="
 echo "colabctl: $(which colabctl)"
 echo "pony:     $(which pony)"
+echo "zimage:   $(which zimage)"
 echo ""
 echo "Next:"
-echo "  1. Authenticate: see references/auth_flow.md"
-echo "  2. Deploy Pony Diffusion: see AGENTS.md → Pony Diffusion Deployment"
+echo "  1. Authenticate Colab: see references/auth_flow.md"
+echo "  2. Deploy Z-Image-Turbo: zimage/AGENTS.md"
+echo "  3. Deploy Pony Diffusion: see AGENTS.md → Pony Diffusion Deployment"

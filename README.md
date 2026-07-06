@@ -1,25 +1,25 @@
-# Hermes Colab CLI + Pony Diffusion V6 XL
+# Hermes Colab CLI + Diffusion Models
 
-Token-efficient CLI for Google Colab GPU runtimes, plus a full deployment
-of Pony Diffusion V6 XL on free T4 GPUs.
+Token-efficient CLI for Google Colab GPU runtimes, plus deployment of
+Pony Diffusion V6 XL and Z-Image-Turbo on free T4 GPUs.
 
 ## What's Included
 
 ### Colab CLI (colab.py v2.2)
-33 commands for Colab session management with pointer-JSON output:
-- Session: new, sessions, status, stop, restart, gpu_switch
-- Execution: exec, exec_bg, exec_bg_poll, console, repl
-- Files: upload, download, ls, rm
-- **NEW** logs, check — VM file streaming and pre-flight model tests
-- Tunnel persistence, notebook export, secrets management
+33 commands for Colab session management with pointer-JSON output.
+
+### Z-Image-Turbo (zimage/)
+Deploy Alibaba Tongyi-MAI Z-Image-Turbo (6B) on Colab T4:
+- FastAPI server with Cloudflare tunnel
+- Local chatbox CLI (`zimage chat`)
+- 512×512 generation in ~85s on free T4
+- Fallback one-shot generation via `colab run`
+- See `zimage/AGENTS.md` for setup
 
 ### Pony Diffusion V6 XL (pony.py v2.0)
 Deploy Pony Diffusion V6 XL on Colab T4:
-- FastAPI server with ZIP output (no inline images)
+- FastAPI server with ZIP output
 - Local CLI chatbox with interactive mode
-- Parallel batch generation (2 concurrent workers)
-- Auto-reconnect watchdog
-- Image viewer
 
 ## Install
 
