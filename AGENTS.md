@@ -99,6 +99,23 @@ tunnel set --url URL -s NAME    Save tunnel URL
 6. **Security fixes** — shell injection in `console` fixed (json.dumps
    escaping). `tunnel_discover` shell=True replaced with list form.
 
+### Output format notes
+
+- `exec` returns output directly. Use for short commands (< 2 min).
+- `exec_bg` runs in background. Use `--json` flag to get the job_id for polling:
+  ```bash
+  python3 colab.py exec_bg -s nbqa --json --timeout 300 --code "..."
+  # Returns: {"job_id":"abc123","status":"running","poll":"exec_bg_poll abc123"}
+  python3 colab.py exec_bg_poll abc123
+  ```
+- `upload` has a ~30s timeout. Files >10 MB should be downloaded directly on
+  the Colab VM instead (use `exec` with `urllib.request.urlretrieve`).
+- `upload` fails with HTTP 500 if parent directories don't exist on the VM.
+  Create them first with `exec`:
+  ```bash
+  python3 colab.py exec -s nbqa --code "import os; os.makedirs('/root/.notebooklm/profiles/default', exist_ok=True)"
+  ```
+
 ## Deployment Patterns
 
 ### Pattern 1: Quick LLM Deploy (exec_detach)
@@ -200,3 +217,11 @@ Error output: `{"ok":false,"err":"<code>","msg":"<message>"}` (~25 tokens)
    deploy log for progress.
 10. **Colab OAuth token at `~/.config/colab-cli/token.json`** — auto-refreshed
     by background thread every 5 min.
+11. **exec_bg needs `--json` flag** to output a poll-able job_id. Without it,
+    the command returns no usable output for tracking progress.
+12. **Cloudflared needs `--metrics 0.0.0.0:0`** when running alongside other
+    cloudflared instances — avoids port 20241 conflicts.
+13. **Upload to nested paths fails without mkdir.** Always create parent
+    directories on the VM before uploading to paths like `/root/.notebooklm/...`.
+14. **Large files (>10 MB) time out on upload.** Download directly on the VM
+    instead: `urllib.request.urlretrieve(url, '/content/bigfile')`.
