@@ -85,16 +85,41 @@ download -s NAME REMOTE LOCAL   Download file
 ls -s NAME [PATH]               List VM files
 logs -s NAME FILE [-n N] [-f]   Tail/stream VM file
 
-tunnel_discover -s NAME         Auto-discover tunnel URL
-tunnel get -s NAME              Get saved URL
-tunnel set --url URL -s NAME    Save URL
+tunnel_discover -s NAME Auto-discover tunnel URL
+tunnel get -s NAME Get saved URL
+tunnel set --url URL -s NAME Save URL
 
-whoami                          Auth identity
-version                         CLI version
+recover Rebuild sessions.json from backend (wiped registry fix)
+reauth [--account EMAIL] Switch Colab account (per-account GPU quota)
+patch Apply 401/404 refresh-retry patch to installed colab_cli
+
+whoami Auth identity
+version CLI version
 ```
 
 All commands output pointer-JSON by default. Use `-o FILE` for file output,
 `--json` for inline JSON.
+
+## Reliability notes (from LTX-2.3 Colab deployment, 2026-08)
+
+- **Wiped session registry**: `sessions.json` can be cleared by crashes or the
+  upstream CLI's cleanup. `colabctl recover` rebuilds it from the backend —
+  a live VM is NOT lost (a wiped registry previously cost 40GB of model
+  re-downloads). `exec`/`run` also auto-recover once on "Session not found".
+- **Per-account GPU quota**: free-tier Colab rejects new T4 sessions with
+  `503 Service Unavailable` / `outcome:2` after ~3-4 GPU sessions/day.
+  Fix: `colabctl reauth --account other@gmail.com` (manual OAuth flow) and
+  re-create the session. The runtime account and Drive account are
+  independent — keep uploads pointed at the original account.
+- **401/404 proxy-token expiry**: the runtime proxy token expires hourly; the
+  upstream CLI treats 401/404 as fatal and prunes the session (killing the
+  keepalive → VM GC). `colabctl patch` applies the refresh-retry fix to the
+  installed package (or a shadow copy at `~/colab_cli_patched` when the
+  package dir is root-owned). A `*/15` keepalive cron should also re-sync the
+  token — see `examples/ltx23/keepalive.py`.
+- **Long-running servers**: `colab run` blocks until the kernel cell
+  completes — split deploys into short exec steps (provision → download →
+  launch) and use `exec_detach` for the server itself.
 
 ## File Structure
 

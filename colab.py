@@ -43,6 +43,12 @@ def _find_colab():
 
 COLAB = _find_colab()
 
+# Patched shadow copy (created by `colabctl patch` when the installed package
+# is root-owned): prefer it so the 401/404 -> refresh-token fix is active.
+PATCHED_SHADOW = os.path.expanduser("~/colab_cli_patched")
+if os.path.isdir(PATCHED_SHADOW):
+    os.environ["PYTHONPATH"] = PATCHED_SHADOW + os.pathsep + os.environ.get("PYTHONPATH", "")
+
 def die(code, msg):
     print(json.dumps({"ok": False, "err": code, "msg": msg}))
     sys.exit(1)
@@ -74,6 +80,11 @@ def run_colab(args, timeout=120, stdin_data=None, env=None, retries=MAX_RETRIES)
             if r.returncode == 0 or not _is_retryable(r.stderr, r.returncode):
                 return r.stdout, r.stderr, r.returncode
             last_stdout, last_stderr, last_rc = r.stdout, r.stderr, r.returncode
+            # Wiped/expired session registry? Rebuild from the backend once,
+            # then retry — this saved 40GB of model re-downloads in the field.
+            combined = (r.stderr + r.stdout).lower()
+            if attempt == 0 and ("session" in combined and "not found" in combined):
+                _auto_recover()
             if attempt < retries:
                 time.sleep(RETRY_DELAY * (attempt + 1))
         except subprocess.TimeoutExpired:
@@ -84,6 +95,52 @@ def run_colab(args, timeout=120, stdin_data=None, env=None, retries=MAX_RETRIES)
         except FileNotFoundError:
             return "", "colab binary not found", -2
     return last_stdout, last_stderr, last_rc
+
+def _auto_recover():
+    """Rebuild sessions.json from list_assignments() (same as cmd_recover)."""
+    code = (
+        "import sys; sys.path.insert(0, '/usr/local/lib/python3.12/dist-packages')\n"
+        "from colab_cli.common import state\n"
+        "import json, os\n"
+        "try:\n"
+        "    assignments = state.client.list_assignments()\n"
+        "except Exception:\n"
+        "    sys.exit(0)\n"
+        "store_path = os.path.expanduser('~/.config/colab-cli/sessions.json')\n"
+        "store = json.load(open(store_path)) if os.path.exists(store_path) else {}\n"
+        "changed = False\n"
+        "for a in assignments:\n"
+        "    ep = a.endpoint\n"
+        "    hit = None\n"
+        "    for name, s in store.items():\n"
+        "        if s.get('endpoint') == ep:\n"
+        "            hit = (name, s); break\n"
+        "    if hit:\n"
+        "        name, s = hit\n"
+        "        s['url'] = a.runtime_proxy_info.url\n"
+        "        s['token'] = a.runtime_proxy_info.token\n"
+        "        changed = True\n"
+        "    else:\n"
+        "        tail = ep.split('-')[-1][:10]\n"
+        "        store['recovered_' + tail] = {\n"
+        "            'name': ep, 'url': a.runtime_proxy_info.url,\n"
+        "            'token': a.runtime_proxy_info.token, 'endpoint': ep,\n"
+        "            'variant': getattr(a, 'variant', 'GPU'),\n"
+        "            'accelerator': getattr(a, 'accelerator', 'T4')}\n"
+        "        changed = True\n"
+        "if changed:\n"
+        "    json.dump(store, open(store_path, 'w'), indent=2)\n"
+        "    print('AUTO_RECOVERED')\n"
+    )
+    try:
+        tmp = COLAB_HOME / "auto_recover.py"
+        tmp.write_text(code)
+        r = subprocess.run([sys.executable, str(tmp)], capture_output=True,
+                           text=True, timeout=60)
+        if "AUTO_RECOVERED" in (r.stdout or ""):
+            print("[colab] session registry was stale — rebuilt from backend", file=sys.stderr)
+    except Exception:
+        pass
 
 def parse_error(stdout, stderr):
     combined = (stdout + "\n" + stderr).lower()
@@ -1017,6 +1074,149 @@ def cmd_tunnel(args):
         write_output(f"Tunnel URL saved for {s or 'default'}: {url}", args.out, args.json)
 
 
+# ─── P1: recover — rebuild sessions.json from the backend ──────────────────
+# The colab-cli registry (sessions.json) can be wiped by crashes or the
+# upstream CLI's destructive cleanup. This rebuilds it from the server's
+# list_assignments() so a live VM is NOT lost (a wiped registry previously
+# caused 40GB of models to be re-downloaded).
+
+def cmd_recover(args):
+    code = (
+        "import sys; sys.path.insert(0, '/usr/local/lib/python3.12/dist-packages')\n"
+        "from colab_cli.common import state\n"
+        "import json, os\n"
+        "try:\n"
+        "    assignments = state.client.list_assignments()\n"
+        "except Exception as e:\n"
+        "    print('LIST_FAIL ' + str(e)[:200]); sys.exit(1)\n"
+        "store_path = os.path.expanduser('~/.config/colab-cli/sessions.json')\n"
+        "store = json.load(open(store_path)) if os.path.exists(store_path) else {}\n"
+        "changed = False\n"
+        "for a in assignments:\n"
+        "    ep = a.endpoint\n"
+        "    hit = None\n"
+        "    for name, s in store.items():\n"
+        "        if s.get('endpoint') == ep:\n"
+        "            hit = (name, s); break\n"
+        "    if hit:\n"
+        "        name, s = hit\n"
+        "        s['url'] = a.runtime_proxy_info.url\n"
+        "        s['token'] = a.runtime_proxy_info.token\n"
+        "        changed = True\n"
+        "    else:\n"
+        "        tail = ep.split('-')[-1][:10]\n"
+        "        store['recovered_' + tail] = {\n"
+        "            'name': ep, 'url': a.runtime_proxy_info.url,\n"
+        "            'token': a.runtime_proxy_info.token, 'endpoint': ep,\n"
+        "            'variant': getattr(a, 'variant', 'GPU'),\n"
+        "            'accelerator': getattr(a, 'accelerator', 'T4')}\n"
+        "        changed = True\n"
+        "if changed:\n"
+        "    json.dump(store, open(store_path, 'w'), indent=2)\n"
+        "    print('RECOVERED ' + json.dumps({k: v.get('endpoint') for k, v in store.items()}))\n"
+        "else:\n"
+        "    print('NO_ASSIGNMENTS')\n"
+    )
+    tmp = COLAB_HOME / "recover.py"
+    tmp.write_text(code)
+    try:
+        r = subprocess.run([sys.executable, str(tmp)], capture_output=True,
+                           text=True, timeout=120)
+        out = (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        out = "timeout"
+    if "RECOVERED" in out:
+        write_output(out, args.out, args.json, {"status": "recovered"})
+    elif "NO_ASSIGNMENTS" in out:
+        write_output("No live assignments found. Is the VM still running?",
+                     args.out, args.json, {"status": "no-assignments"})
+    else:
+        die("recover-failed", out.strip()[-400:])
+
+
+# ─── P2: reauth — switch the Colab account (manual OAuth flow) ─────────────
+# Free-tier GPU quota is per-account; when `new` returns 503 outcome:2 the
+# account is exhausted for the day. Re-auth as another Google account and
+# keep the same session name. The flow prints an AUTH_URL; open it in a
+# browser, approve, and the token is saved.
+
+def cmd_reauth(args):
+    hint = getattr(args, "account", None)
+    code = f'''
+import sys, os, json, threading, time
+from urllib.parse import urlparse, parse_qs
+from http.server import BaseHTTPRequestHandler, HTTPServer
+sys.path.insert(0, "/usr/local/lib/python3.12/dist-packages")
+os.environ.setdefault("PYTHONPATH", "")
+from colab_cli.auth import PUBLIC_SCOPES
+from google_auth_oauthlib.flow import InstalledAppFlow
+PORT = 8765
+cfg = None
+for c in [os.path.expanduser("~/.colab-cli-oauth-config.json"),
+          "/usr/local/lib/python3.12/dist-packages/colab_cli/oauth_config.json"]:
+    if os.path.exists(c):
+        cfg = json.load(open(c)); break
+if not cfg:
+    print("NO_CLIENT_CONFIG"); sys.exit(1)
+flow = InstalledAppFlow.from_client_config(cfg, PUBLIC_SCOPES)
+flow.redirect_uri = f"http://localhost:{{PORT}}"
+kwargs = dict(access_type="offline", prompt="consent",
+              include_granted_scopes="true")
+{"if hint: kwargs['login_hint'] = %r" % hint}
+auth_url, _ = flow.authorization_url(**kwargs)
+print("AUTH_URL: " + auth_url, flush=True)
+holder = {{}}
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        q = parse_qs(urlparse(self.path).query)
+        if "code" in q:
+            holder["code"] = q["code"][0]
+            self.send_response(200); self.end_headers()
+            self.wfile.write(b"OK - close this tab")
+        else:
+            self.send_response(400); self.end_headers(); self.wfile.write(b"no code")
+    def log_message(self, *a): pass
+srv = HTTPServer(("127.0.0.1", PORT), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+deadline = time.time() + 900
+while "code" not in holder and time.time() < deadline:
+    time.sleep(1)
+if "code" not in holder:
+    print("TIMEOUT"); sys.exit(1)
+flow.fetch_token(code=holder["code"])
+open(os.path.expanduser("~/.config/colab-cli/token.json"), "w").write(
+    flow.credentials.to_json())
+print("SAVED " + ",".join(flow.credentials.scopes or []), flush=True)
+'''
+    tmp = COLAB_HOME / "reauth_flow.py"
+    tmp.write_text(code)
+    print("Open the AUTH_URL below in a browser, approve, and the CLI account "
+          "switches. (See references/auth_flow.md for the manual flow.)")
+    r = subprocess.run([sys.executable, str(tmp)], capture_output=True,
+                       text=True, timeout=960)
+    out = (r.stdout or "") + (r.stderr or "")
+    if "SAVED" in out:
+        write_output("Token saved; scopes: " + out.split("SAVED ", 1)[1],
+                     args.out, args.json, {"status": "reauth-ok"})
+    else:
+        die("reauth-failed", out.strip()[-400:])
+
+
+# ─── P3: patch — apply the 401/404-refresh reliability patch ──────────────
+def cmd_patch(args):
+    here = Path(__file__).resolve().parent
+    script = here / "patch_colab_cli.py"
+    if not script.exists():
+        die("patch-no-script", f"{script} not found in repo")
+    r = subprocess.run([sys.executable, str(script)], capture_output=True,
+                       text=True, timeout=120)
+    out = (r.stdout or "") + (r.stderr or "")
+    if "patched" in out or "already patched" in out:
+        write_output(out.strip(), args.out, args.json, {"status": "patched"})
+    else:
+        die("patch-failed", out.strip()[-400:])
+
+
 # ─── CLI ───────────────────────────────────────────────────────────────────
 
 def build_parser():
@@ -1104,6 +1304,9 @@ def build_parser():
     pr4 = sub.add_parser("resources", parents=[shared_output], help="VM resources"); pr4.add_argument("-s", "--session")
     psh = sub.add_parser("share", parents=[shared_output], help="Share URL"); psh.add_argument("-s", "--session")
     pt = sub.add_parser("tunnel", parents=[shared_output], help="Tunnel URL mgmt"); pt.add_argument("-s", "--session"); pt.add_argument("action", nargs="?", default="get", choices=["get","set"]); pt.add_argument("--url")
+    prc = sub.add_parser("recover", parents=[shared_output], help="Rebuild sessions.json from backend (fixes wiped registry)")
+    pra = sub.add_parser("reauth", parents=[shared_output], help="Re-auth / switch Colab account (per-account GPU quota)"); pra.add_argument("--account", help="login_hint email")
+    ppp = sub.add_parser("patch", parents=[shared_output], help="Patch installed colab_cli: 401/404 -> refresh token + retry")
 
     return p
 
@@ -1128,6 +1331,7 @@ def main():
         "tunnel": cmd_tunnel, "tunnel_discover": cmd_tunnel_discover,
         "pay": cmd_pay, "version": cmd_version, "update": cmd_update, "whoami": cmd_whoami,
         "secrets": cmd_secrets, "resources": cmd_resources, "share": cmd_share,
+        "recover": cmd_recover, "reauth": cmd_reauth, "patch": cmd_patch,
     }
     try:
         dispatcher[args.command](args)

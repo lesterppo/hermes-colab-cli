@@ -14,6 +14,12 @@ echo "=== Hermes Colab CLI + Model Deployments Installer ==="
 echo "Installing Python dependencies..."
 pip install --quiet google-colab-cli requests
 
+# Apply the reliability patch (401/404 -> refresh token + retry instead of
+# prune_session). Falls back to a writable shadow copy at ~/colab_cli_patched
+# when the package dir is root-owned (no sudo needed).
+echo "Patching colab_cli for 401/404 refresh-retry..."
+python3 "$SCRIPT_DIR/patch_colab_cli.py" || echo "(patch optional — continuing)"
+
 # Colab CLI
 cp "$SCRIPT_DIR/colab.py" "$COLAB_DEST/colab.py"
 chmod +x "$COLAB_DEST/colab.py"
