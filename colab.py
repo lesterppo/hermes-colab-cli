@@ -43,11 +43,38 @@ def _find_colab():
 
 COLAB = _find_colab()
 
+# The installed `colab` script may shebang to a broken python (e.g. a venv
+# with mismatched pydantic_core). Prefer invoking the package via a working
+# system python: `/usr/bin/python3 -m colab_cli.cli`.
+COLAB_PY = None
+for cand in ("/usr/bin/python3", "/usr/bin/python"):
+    if os.path.exists(cand):
+        COLAB_PY = cand
+        break
+
 # Patched shadow copy (created by `colabctl patch` when the installed package
 # is root-owned): prefer it so the 401/404 -> refresh-token fix is active.
 PATCHED_SHADOW = os.path.expanduser("~/colab_cli_patched")
 if os.path.isdir(PATCHED_SHADOW):
     os.environ["PYTHONPATH"] = PATCHED_SHADOW + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+# The host shell (e.g. inside Hermes) may inject a venv's site-packages into
+# PYTHONPATH, which breaks /usr/bin/python3's pydantic (mismatched
+# pydantic_core). Strip venv/hermes paths from PYTHONPATH for every subprocess.
+def _clean_env():
+    env = os.environ.copy()
+    pp = env.get("PYTHONPATH", "")
+    keep = [p for p in pp.split(os.pathsep)
+            if p and "venv" not in p and ".hermes/hermes-agent" not in p]
+    cleaned = os.pathsep.join(keep)
+    env["PYTHONPATH"] = cleaned
+    env.pop("VIRTUAL_ENV", None)
+    return env
+
+
+def _py_for_scripts():
+    """System python for helper scripts (venv python has broken pydantic_core)."""
+    return COLAB_PY or sys.executable
 
 def die(code, msg):
     print(json.dumps({"ok": False, "err": code, "msg": msg}))
@@ -69,8 +96,11 @@ def _is_retryable(stderr, rc):
     return False
 
 def run_colab(args, timeout=120, stdin_data=None, env=None, retries=MAX_RETRIES):
-    cmd = [COLAB] + args
-    merged_env = os.environ.copy()
+    if COLAB_PY:
+        cmd = [COLAB_PY, "-m", "colab_cli.cli"] + args
+    else:
+        cmd = [COLAB] + args
+    merged_env = _clean_env()
     if env: merged_env.update(env)
     last_stdout, last_stderr, last_rc = "", "", -1
     for attempt in range(retries + 1):
@@ -1120,8 +1150,8 @@ def cmd_recover(args):
     tmp = COLAB_HOME / "recover.py"
     tmp.write_text(code)
     try:
-        r = subprocess.run([sys.executable, str(tmp)], capture_output=True,
-                           text=True, timeout=120)
+        r = subprocess.run([_py_for_scripts(), str(tmp)], capture_output=True,
+                           text=True, timeout=120, env=_clean_env())
         out = (r.stdout or "") + (r.stderr or "")
     except subprocess.TimeoutExpired:
         out = "timeout"
@@ -1192,8 +1222,8 @@ print("SAVED " + ",".join(flow.credentials.scopes or []), flush=True)
     tmp.write_text(code)
     print("Open the AUTH_URL below in a browser, approve, and the CLI account "
           "switches. (See references/auth_flow.md for the manual flow.)")
-    r = subprocess.run([sys.executable, str(tmp)], capture_output=True,
-                       text=True, timeout=960)
+    r = subprocess.run([_py_for_scripts(), str(tmp)], capture_output=True,
+                       text=True, timeout=960, env=_clean_env())
     out = (r.stdout or "") + (r.stderr or "")
     if "SAVED" in out:
         write_output("Token saved; scopes: " + out.split("SAVED ", 1)[1],
@@ -1208,8 +1238,8 @@ def cmd_patch(args):
     script = here / "patch_colab_cli.py"
     if not script.exists():
         die("patch-no-script", f"{script} not found in repo")
-    r = subprocess.run([sys.executable, str(script)], capture_output=True,
-                       text=True, timeout=120)
+    r = subprocess.run([_py_for_scripts(), str(script)], capture_output=True,
+                       text=True, timeout=120, env=_clean_env())
     out = (r.stdout or "") + (r.stderr or "")
     if "patched" in out or "already patched" in out:
         write_output(out.strip(), args.out, args.json, {"status": "patched"})
