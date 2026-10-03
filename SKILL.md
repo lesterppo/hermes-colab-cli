@@ -206,3 +206,14 @@ if it dies and extracts the new URL.
    Use direct-download URLs or HF_TOKEN for reliable fast deploys.
 9. **hf_transfer package required** — deploy script auto-installs it.
 10. **4-bit quantization uses ~2.4GB VRAM** — leaves headroom on T4.
+
+### Colab Python deps & API quirks
+11. **Colab 411s empty-body POSTs on /tun/m/assign and /tun/m/unassign** —
+    fixed by `patch_colab_cli.py` (fix 2: sends `data="{}"`). Re-run
+    `python3 colab.py patch` (or `./install.sh`) after any
+    `pip install -U google-colab-cli`.
+12. **peft needs torchao>0.16 but Colab ships torchao 0.10** → `ImportError`
+    at `get_peft_model`. On the Colab VM run `pip uninstall -y torchao`
+    (peft falls back to its default LoRA path) or `pip install -U torchao`.
+    Put the uninstall line right after the `pip install` block in any Colab
+    driver script that uses peft/LoRA.
