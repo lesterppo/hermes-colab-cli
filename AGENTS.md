@@ -225,3 +225,12 @@ Error output: `{"ok":false,"err":"<code>","msg":"<message>"}` (~25 tokens)
     directories on the VM before uploading to paths like `/root/.notebooklm/...`.
 14. **Large files (>10 MB) time out on upload.** Download directly on the VM
     instead: `urllib.request.urlretrieve(url, '/content/bigfile')`.
+15. **peft dispatches LoRA through torchao and needs torchao>0.16; Colab
+    ships torchao 0.10** → `ImportError` at `get_peft_model`. On the Colab
+    VM: `pip uninstall -y torchao` (falls back to peft's default LoRA path)
+    or `pip install -U torchao`. Put the uninstall right after the pip
+    installs in Colab driver scripts. (found 2026-10-04)
+16. **Colab returns HTTP 411 "Length Required" on /tun/m/assign and
+    /tun/m/unassign** — empty-body POSTs are rejected. `patch_colab_cli.py`
+    (fix 2, 2026-10-04) sends `data="{}"` on both. Re-run the patch after
+    any `pip install -U google-colab-cli`.
