@@ -488,7 +488,7 @@ def cmd_tunnel_discover(args):
         "for f in sorted(files_to_check):\n"
         "    try:\n"
         "        content = open(f).read()\n"
-        "        found = re.findall(r'https://[a-zA-Z0-9.-]*\\.trycloudflare\\\\.com[^\\s\"\\'<>]*', content)\n"
+        "        found = re.findall(r'https://[a-zA-Z0-9.-]*\\.trycloudflare\\.com[^\\s\"\\'<>]*', content)\n"
         "        if found:\n"
         "            for u in found:\n"
         "                clean = u.rstrip('/')\n"
