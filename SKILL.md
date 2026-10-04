@@ -217,3 +217,42 @@ if it dies and extracts the new URL.
     (peft falls back to its default LoRA path) or `pip install -U torchao`.
     Put the uninstall line right after the `pip install` block in any Colab
     driver script that uses peft/LoRA.
+
+## Large-Model QLoRA on Colab T4 (7–8B)
+
+Proven recipe — this is exactly what Peter's `soup-daily-finetune` runs
+daily (`Llama-3.1-8B-Instruct`, NF4 QLoRA, finance-alpaca). A free T4
+(16 GB) fits 7–8B quantized; this is the training track's graduation path
+from 0.5B toys.
+
+**Deps (order matters):**
+```bash
+pip uninstall -y torchao   # Colab's 0.10 breaks peft
+pip install 'transformers>=4.46,<5.0' 'trl>=0.14,<0.29' bitsandbytes \
+  accelerate peft datasets safetensors
+# Colab ships transformers 5.x — MUST downgrade to <5.0
+```
+
+**Load (4-bit NF4):**
+```python
+bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                         bnb_4bit_use_double_quant=True,
+                         bnb_4bit_compute_dtype=torch.bfloat16)
+model = AutoModelForCausalLM.from_pretrained(base, quantization_config=bnb,
+                                             device_map="auto")
+# Do NOT call prepare_model_for_kbit_training() — it casts the frozen bf16
+# base to fp32 and crashes the fp16 GradScaler path on T4.
+```
+
+**LoRA:** r=16, alpha=32, dropout 0.0, all 7 linears
+(`q/k/v/o/gate/up/down_proj`). **Train:** batch 4, seq 512, lr 2e-4,
+**bf16** mixed precision — NOT fp16 (fp16 crashes at `clip_grad_norm` on
+T4). `trl` `SFTTrainer` works.
+
+**Notes:**
+- 8B NF4 ≈ 5 GB weights; full QLoRA (LoRA + optimizer + activations at
+  batch 4 / seq 512) fits 16 GB with headroom.
+- Gated models (Llama) need `HF_TOKEN`; `Qwen2.5-7B-Instruct` is ungated —
+  use it for recipe verification without secrets.
+- For long runs, copy `soup-daily-finetune`'s Drive-checkpointing pattern
+  (push adapter to Drive every N steps; free sessions recycle in ~2–12h).
