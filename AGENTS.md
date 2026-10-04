@@ -234,3 +234,8 @@ Error output: `{"ok":false,"err":"<code>","msg":"<message>"}` (~25 tokens)
     /tun/m/unassign** — empty-body POSTs are rejected. `patch_colab_cli.py`
     (fix 2, 2026-10-04) sends `data="{}"` on both. Re-run the patch after
     any `pip install -U google-colab-cli`.
+17. **Large-model QLoRA on T4 (7–8B)** — proven recipe in SKILL.md (from
+    Peter's `soup-daily-finetune`: NF4, r=16/alpha=32, all 7 linears,
+    batch 4 / seq 512 / lr 2e-4, bf16 NOT fp16, transformers<5.0, uninstall
+    torchao, no `prepare_model_for_kbit_training()`). This is the arXiv
+    training track's graduation path from 0.5B toys.
