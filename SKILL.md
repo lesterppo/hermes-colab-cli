@@ -256,3 +256,36 @@ T4). `trl` `SFTTrainer` works.
   use it for recipe verification without secrets.
 - For long runs, copy `soup-daily-finetune`'s Drive-checkpointing pattern
   (push adapter to Drive every N steps; free sessions recycle in ~2–12h).
+
+## Large Models on a T4: the Playbook
+
+Free Colab gives one T4 (15.36 GB usable). Peter's repos prove 8–30 GB
+weight stacks run on it. The levers, in order of impact:
+
+1. **Quantize the weights** — pick per stack:
+   - Transformers LLM (train or infer): **NF4** via bitsandbytes — 8B ≈ 5 GB
+     (see QLoRA recipe above; `soup-daily-finetune` trains 8B daily).
+   - GGUF-compatible (llama.cpp / ComfyUI GGUF nodes): **Q5_K_M** for the big
+     weights, **Q3_K_M** where VRAM is tight — `ltx23-deploy` runs a
+     15.2 GB Q5 UNet + 5.7 GB Q3 text encoder on T4. Grade is load-bearing:
+     fp8 OOMs where Q3 fits.
+   - ComfyUI native: **INT8 repack** (`convrot`) — `minimax-music3-colab`
+     fits a 22 GB (officially two-GPU) model into 11.9 GB.
+2. **Offload what doesn't fit** — diffusers `enable_model_cpu_offload()`
+   streams submodules between CPU and VRAM (`qwen-image-2.1-colab` runs
+   30 GB of bf16 weights on 15 GB). ComfyUI `--lowvram --cache-none`. Run
+   heavy stages sequentially (e.g. upscale only after the sampler frees
+   VRAM).
+3. **Shrink the working set** — cap resolution (1536px, not native 2K),
+   tiled VAE decode, chunked feedforward, attention/VAE slicing. At runtime
+   it's usually *activations*, not weights, that OOM.
+4. **Precision: bf16 everywhere on T4.** fp16 crashes `clip_grad_norm`;
+   fp8 can OOM where GGUF-Q3 fits.
+5. **torchao is stack-dependent** — peft training wants it gone
+   (`pip uninstall -y torchao`, Colab's 0.10 breaks `get_peft_model`);
+   diffusers-main inference wants it *upgraded*. Match it to the stack,
+   don't cargo-cult one rule.
+6. **Ops for free-tier survival** — Drive checkpointing (sessions recycle
+   in ~2–12h), `exec_detach` + Cloudflare tunnel for servers, retry
+   watchdogs. HF token optional but avoids anonymous rate limits on big
+   downloads — pass via env/file, never hardcoded.
