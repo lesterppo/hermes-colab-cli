@@ -38,6 +38,14 @@ Deploy Pony Diffusion V6 XL on Colab T4:
 - FastAPI server with ZIP output
 - Local CLI chatbox with interactive mode
 
+### LLM Deployment → [lesterppo/colab-llm-deploy](https://github.com/lesterppo/colab-llm-deploy)
+One-shot LLM deployment on Colab GPUs, agent-driven via this CLI:
+- VM driver (`deploy_llm.py`) with Ollama default (GGUF Q4_K_M) / vLLM option,
+  VRAM-tiered model catalog (`models.json`), health-gated readiness
+- OpenAI-compatible endpoints (`/v1/chat/completions`) + Cloudflare tunnel
+- Orchestrated with the primitives above:
+  `new` → `exec_detach` → poll status → `tunnel_discover`
+
 ## Install
 
 ```bash
