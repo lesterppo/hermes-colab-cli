@@ -79,6 +79,14 @@ tunnel get -s NAME              Get saved tunnel URL
 tunnel set --url URL -s NAME    Save tunnel URL
 ```
 
+## Related repos
+
+- **[lesterppo/colab-llm-deploy](https://github.com/lesterppo/colab-llm-deploy)** —
+  one-shot LLM deployment on Colab GPUs (Ollama/vLLM + Cloudflare tunnel),
+  agent-driven via this CLI's `exec_detach` / `tunnel_discover` primitives.
+  The generic `deploy_llm` orchestration lives there; model-specific clients
+  (qwen-chat, zimage, pony) live here.
+
 ## v3.1 Key Improvements
 
 1. **exec_detach** — THE way to launch long-running servers. Upload script,
