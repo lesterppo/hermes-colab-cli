@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""colab-cli v3.2 — AI-agent-native CLI for Google Colab.
+"""colab-cli v3.3.2 — AI-agent-native CLI for Google Colab.
 
 Fixes over v3.0:
 - P0: Retry logic for transient Colab errors (502/503/timeout), up to 2 retries
@@ -10,6 +10,32 @@ Fixes over v3.0:
 - P1: shlex.split() for pip args (handles quoted arguments)
 - P1: Browser sleeps replaced with wait_for_selector / wait_for_timeout
 - P2: All =run_colab / =_remote_pexec spacing fixed
+
+v3.3 (Oct 2026, from the failing arXiv training-track review):
+- Pre-flight proxy-aware token refresh in run_colab itself, so EVERY
+  command refreshes before calling the raw CLI (whose google-auth
+  transport ignores proxy env and falls into interactive OAuth on expiry)
+- token refresh / refresh-all / status (rotation pool only, never secrets)
+- account list / switch / rotate (daily rotation; cyc236de/cyc236hk
+  hard-excluded) + --registry-file for isolated session registries
+- new: kernel health check after create (kills the phantom-READY class)
+- train: one command housing a whole daily training-track run —
+  rotate, refresh, create+health-check with cross-account retry,
+  upload, detached launch, supervised monitoring, result download,
+  honest DONE/RECLAIMED/DIED/TIMEOUT/PROVISION_FAILED classification
+- wrapper-side session registry, so a vanished session reads as
+  RECLAIMED instead of a bare "not found"
+
+v3.3.2 (Oct 2026, ToolSelect verify3–verify5):
+- train monitor greps the WHOLE log for the done-marker every poll
+  (a ~56-line results JSON printed after the marker once hid it from a
+  40-line tail and misclassified a completed run as DIED); drivers
+  should still print the marker last
+- train --rotate rewrites the rotation state to the account that
+  actually ran when creation falls back (picked ppoppo205, ran on
+  cyc236es — otherwise the next day repeats the fallback account)
+- train --watch-only prefers the wrapper registry's recorded account
+  over the live active token (shared VM: the symlink may have moved)
 
 Wraps the official google-colab-cli with token-efficient output.
 """
@@ -23,8 +49,26 @@ COLAB_HOME = Path.home() / ".hermes" / "scripts" / "colab"
 COLAB_HOME.mkdir(parents=True, exist_ok=True)
 TUNNEL_FILE = COLAB_HOME / "tunnel_url.json"
 TOKEN_FILE = Path.home() / ".config" / "colab-cli" / "token.json"
+TOKEN_DIR = Path.home() / ".config" / "colab-cli"
 CACHE_DIR = Path.home() / ".cache" / "colab-cli"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Isolated session-registry file for raw-CLI --config mode. When set (via
+# --state-file), every raw-CLI invocation gets `--config <file>` BEFORE the
+# subcommand, so wrapper protections (refresh, retry, registry) apply to
+# isolated-state work too. Previously agents dropped to raw `colab_cli.cli`
+# directly for --config work and lost all of them (Oct 2026: interactive
+# OAuth hang on token expiry, wiped state file misread as "not found").
+CONFIG_FILE = None
+
+# Training-track account rotation (standing rule, set 2026-10-24): a
+# different account every day, never two days in a row on the same one.
+# cyc236de / cyc236hk belong to another agent and are NEVER selected.
+ROTATION_POOL = ["ppoppo205", "cyc236es", "kyu008008", "kyu009009", "cyc236ha"]
+ROTATION_EXCLUDED = {"cyc236de", "cyc236hk"}
+ROTATION_STATE_DEFAULT = (Path.home() / "workspace" / "goals" /
+                          "arxiv-daily-read-and-test" / "hidden_files" /
+                          "colab_account_rotation.txt")
 
 # ── Auth token management ──────────────────────────────────────────────────
 
@@ -96,8 +140,22 @@ def _is_retryable(stderr, rc):
     return False
 
 def run_colab(args, timeout=120, stdin_data=None, env=None, retries=MAX_RETRIES):
+    # Single choke point for every raw-CLI call: refresh the OAuth token
+    # BEFORE the call if it expires within 10 minutes, using the
+    # proxy-aware urllib path (the raw CLI's google-auth transport ignores
+    # proxy env and falls into interactive OAuth on expiry — the Oct 2026
+    # hang). Cheap when the token is fresh (one local file read).
+    global CONFIG_FILE
+    try:
+        if _token_expires_soon(600):
+            _try_refresh_token()
+    except Exception:
+        pass
     if COLAB_PY:
-        cmd = [COLAB_PY, "-m", "colab_cli.cli"] + args
+        cmd = [COLAB_PY, "-m", "colab_cli.cli"]
+        if CONFIG_FILE:
+            cmd += ["--config", str(CONFIG_FILE)]
+        cmd += args
     else:
         cmd = [COLAB] + args
     merged_env = _clean_env()
@@ -219,13 +277,20 @@ def check_rc(stdout, stderr, rc, fallback_code, fallback_msg):
             die(err_code, err_msg or stderr.strip())
         die(fallback_code, stderr.strip() or stdout.strip() or fallback_msg)
 
-def _try_refresh_token():
-    """Attempt to refresh OAuth2 token. Returns True on success."""
-    if not TOKEN_FILE.exists(): return False
+def _refresh_token_file(path):
+    """Refresh one token file via the OAuth2 refresh-token grant, using
+    plain urllib (which honors proxy env vars). Returns (ok, detail).
+    Never prints secrets; detail carries only status/expiry/error class.
+    The raw CLI's google-auth transport ignores proxy env, so this is the
+    only refresh path that works behind the egress proxy."""
+    p = Path(path)
+    if not p.exists():
+        return False, "no-token-file"
     try:
         with _token_lock:
-            creds = json.loads(TOKEN_FILE.read_text())
-            if not creds.get("refresh_token"): return False
+            creds = json.loads(p.read_text())
+            if not creds.get("refresh_token"):
+                return False, "no-refresh-token"
             data = urllib.parse.urlencode({
                 "client_id": creds.get("client_id", ""),
                 "client_secret": creds.get("client_secret", ""),
@@ -234,16 +299,33 @@ def _try_refresh_token():
             }).encode()
             req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
             req.add_header("Content-Type", "application/x-www-form-urlencoded")
-            resp = urllib.request.urlopen(req, timeout=15)
+            resp = urllib.request.urlopen(req, timeout=30)
             t = json.loads(resp.read())
+            if "access_token" not in t:
+                return False, "refresh-rejected"
             creds["token"] = t["access_token"]
+            if t.get("refresh_token"):
+                creds["refresh_token"] = t["refresh_token"]
             creds["expiry"] = datetime.fromtimestamp(
                 datetime.now(timezone.utc).timestamp() + t.get("expires_in", 3600),
                 tz=timezone.utc).isoformat()
-            TOKEN_FILE.write_text(json.dumps(creds, indent=2))
-            return True
-    except Exception:
+            p.write_text(json.dumps(creds, indent=2))
+            return True, creds["expiry"]
+    except urllib.error.HTTPError as e:
+        # invalid_grant = refresh token dead (revoked / 7-day testing-mode
+        # expiry) — only a fresh browser OAuth code fixes it, never a retry.
+        return False, "invalid-grant" if e.code == 400 else f"http-{e.code}"
+    except Exception as e:
+        return False, type(e).__name__
+
+
+def _try_refresh_token():
+    """Attempt to refresh the ACTIVE account's OAuth2 token. Returns True
+    on success. Backwards-compatible wrapper around _refresh_token_file."""
+    if not TOKEN_FILE.exists():
         return False
+    ok, _ = _refresh_token_file(TOKEN_FILE)
+    return ok
 
 def _token_expires_soon(seconds_before=300):
     """Check if token expires within N seconds. Token expiry is stored as ISO string."""
@@ -296,7 +378,14 @@ def format_sessions_list(stdout):
         line = line.strip()
         if not line or line.startswith("─") or "Session" in line or "No active" in line: continue
         parts = line.split()
-        if len(parts) >= 2: sessions.append({"name": parts[0], "status": parts[-1] if len(parts) > 2 else "active"})
+        if len(parts) >= 2:
+            # Raw CLI prints names bracketed: "[smoke-test] <endpoint> | ...".
+            # The brackets must be stripped, or no name ever matches (this
+            # misclassified a live session as RECLAIMED in Oct 2026).
+            name = parts[0].strip("[]")
+            endpoint = parts[1] if parts[1] != "|" else None
+            sessions.append({"name": name, "endpoint": endpoint,
+                             "status": parts[-1] if len(parts) > 2 else "active"})
     return sessions
 
 def _resolve_session(args):
@@ -338,6 +427,16 @@ def cmd_new(args):
     stdout, stderr, rc = run_colab(cargs, timeout=120)
     check_rc(stdout, stderr, rc, "new-failed", "Failed to create session")
     name = args.session or stdout.strip().split()[-1]
+    # Phantom-READY guard (normtune Oct 2026): a session that passes `new`
+    # but whose kernel never answers is unusable — fail here, loudly,
+    # instead of letting a run start on it and die mysteriously.
+    if not getattr(args, "no_health_check", False) and not _health_check(name):
+        die("provision-failed",
+            f"Session '{name}' was created but its kernel never answered "
+            "(runtime proxy 404 / phantom session). Stop it and retry, "
+            "preferably on another account.")
+    _registry_record(name, _active_account(),
+                     {"gpu": getattr(args, "gpu", None)})
     write_output(f"Session '{name}' created.\n{stdout.strip()}", args.out, args.json, {"session": name})
 
 def cmd_exec(args):
@@ -663,6 +762,8 @@ def cmd_stop(args):
     if s: cargs.extend(["-s", s])
     stdout, stderr, rc = run_colab(cargs, timeout=30)
     check_rc(stdout, stderr, rc, "stop-failed", stdout.strip())
+    if s:
+        _registry_remove(s)
     if TUNNEL_FILE.exists():
         data = json.loads(TUNNEL_FILE.read_text())
         if s in data:
@@ -943,7 +1044,7 @@ def cmd_pay(args):
 def cmd_version(args):
     stdout, stderr, rc = run_colab(["version"], timeout=5)
     check_rc(stdout, stderr, rc, "version-failed", stdout.strip())
-    write_output(f"colab-cli v3.2\n{stdout.strip()}", args.out, args.json)
+    write_output(f"colab-cli v3.3\n{stdout.strip()}", args.out, args.json)
 
 
 def cmd_update(args):
@@ -1247,20 +1348,525 @@ def cmd_patch(args):
         die("patch-failed", out.strip()[-400:])
 
 
+# ─── Training-track housing (v3.3) ─────────────────────────────────────────
+# Failure modes harvested from every failing arXiv training-track run
+# (Oct 2026: elitereplay, tf-opd, normtune, lorasuper, toolselect, SRD):
+#  1. token refresh behind proxy (raw CLI's google-auth ignores proxy env)
+#  2. phantom READY: session "created" but runtime proxy 404s, VM unusable
+#  3. gpu-unavailable / quota with no cross-account retry
+#  4. wiped session registry: isolated --config file back as {} after death,
+#     so "session not found" was indistinguishable from "reclaimed"
+#  5. silent driver deaths: no heartbeat, no death classification, no
+#     result download on death
+#  6. wrapper/raw interface mismatch pushing agents onto the raw CLI
+# Reclamation itself cannot be prevented (free tier); everything here is
+# about detecting it fast, classifying it honestly, and resuming cheaply.
+
+REGISTRY_FILE = COLAB_HOME / "train-registry.json"
+
+
+def _active_account():
+    """Name of the currently active Colab account (token.json symlink)."""
+    try:
+        target = os.readlink(TOKEN_FILE)
+        base = os.path.basename(target)
+        if base.startswith("token.") and base.endswith(".json"):
+            return base[len("token."):-len(".json")]
+    except OSError:
+        pass
+    return None
+
+
+def _registry_load():
+    try:
+        if REGISTRY_FILE.exists():
+            return json.loads(REGISTRY_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _registry_save(d):
+    try:
+        REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        REGISTRY_FILE.write_text(json.dumps(d, indent=2))
+    except Exception:
+        pass
+
+
+def _registry_record(name, account, extra=None):
+    d = _registry_load()
+    rec = {"account": account,
+           "created_at": datetime.now(timezone.utc).isoformat()}
+    if extra:
+        rec.update(extra)
+    d[name] = rec
+    _registry_save(d)
+
+
+def _registry_remove(name):
+    d = _registry_load()
+    if name in d:
+        del d[name]
+        _registry_save(d)
+
+
+def _server_sessions():
+    """Names of sessions the server currently reports (best effort)."""
+    stdout, stderr, rc = run_colab(["sessions"], timeout=30)
+    if rc != 0:
+        return None
+    return {s["name"] for s in format_sessions_list(stdout)}
+
+
+def _server_session_map():
+    """{session name: endpoint} from the server list. None if the list
+    call itself failed (distinct from an empty list, which is {})."""
+    stdout, stderr, rc = run_colab(["sessions"], timeout=30)
+    if rc != 0:
+        return None
+    return {s["name"]: s.get("endpoint") for s in format_sessions_list(stdout)
+            if s.get("endpoint")}
+
+
+def _classify_missing(name):
+    """A session absent from the server list is RECLAIMED if the wrapper
+    registry knows it (it existed and Colab took it), UNKNOWN otherwise
+    (never created, or created outside this wrapper)."""
+    if name in _registry_load():
+        return "reclaimed"
+    return "unknown"
+
+
+def _token_expiry(path):
+    """ISO expiry of a token file, or None if unreadable."""
+    try:
+        creds = json.loads(Path(path).read_text())
+        return creds.get("expiry")
+    except Exception:
+        return None
+
+
+def _token_expires_within(path, seconds):
+    exp = _token_expiry(path)
+    if not exp:
+        return True
+    try:
+        if isinstance(exp, (int, float)):
+            ts = float(exp)
+        else:
+            ts = datetime.fromisoformat(
+                str(exp).replace("+00:00", "").replace("Z", "")).timestamp()
+        return (ts - datetime.now(timezone.utc).timestamp()) < seconds
+    except Exception:
+        return True
+
+
+def cmd_token(args):
+    """Token ops: refresh the active account, refresh the whole rotation
+    pool, or show expiries. Never prints secret values."""
+    action = getattr(args, "token_action", "status")
+    if action == "refresh":
+        ok, detail = _refresh_token_file(TOKEN_FILE)
+        if ok:
+            write_output(f"Token refreshed for {_active_account()}; expiry {detail}",
+                         args.out, args.json,
+                         {"account": _active_account(), "expiry": detail})
+        else:
+            die("token-refresh-failed",
+                f"Refresh failed for {_active_account()}: {detail}. "
+                "invalid-grant means the refresh token is dead — re-do the "
+                "browser OAuth code flow (references/auth_flow.md).")
+    elif action == "refresh-all":
+        results = {}
+        for name in ROTATION_POOL:
+            if name in ROTATION_EXCLUDED:
+                continue
+            p = TOKEN_DIR / f"token.{name}.json"
+            if not p.exists():
+                results[name] = "no-token-file"
+                continue
+            if not getattr(args, "force", False) and not _token_expires_within(p, 3600):
+                results[name] = "fresh-skip"
+                continue
+            ok, detail = _refresh_token_file(p)
+            results[name] = "ok" if ok else f"fail:{detail}"
+        write_output(json.dumps(results, indent=2), args.out, args.json,
+                     {"results": results})
+    else:  # status
+        rows = {}
+        for name in ROTATION_POOL:
+            if name in ROTATION_EXCLUDED:
+                continue
+            p = TOKEN_DIR / f"token.{name}.json"
+            rows[name] = _token_expiry(p) if p.exists() else None
+        rows["_active"] = _active_account()
+        write_output(json.dumps(rows, indent=2), args.out, args.json, rows)
+
+
+def _switch_account(name):
+    """Point token.json at token.<name>.json. Refuses excluded accounts."""
+    if name in ROTATION_EXCLUDED:
+        die("account-excluded",
+            f"{name} belongs to another agent and must not be touched. "
+            "Use colab-use-account directly if you truly mean it.")
+    p = TOKEN_DIR / f"token.{name}.json"
+    if not p.exists():
+        die("account-unknown", f"No token file for account {name}")
+    try:
+        if TOKEN_FILE.exists() or TOKEN_FILE.is_symlink():
+            TOKEN_FILE.unlink()
+        TOKEN_FILE.symlink_to(f"token.{name}.json")
+    except OSError as e:
+        die("account-switch-failed", str(e))
+    return name
+
+
+def _read_rotation_state(state_path):
+    """Last-used account from the rotation state file, or None."""
+    try:
+        text = Path(state_path).read_text().strip()
+        if text:
+            return text.split()[-1]
+    except Exception:
+        pass
+    return None
+
+
+def _write_rotation_state(state_path, account):
+    try:
+        Path(state_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(state_path).write_text(
+            f"{datetime.now().strftime('%Y-%m-%d')} {account}\n")
+    except Exception:
+        pass
+
+
+def _next_rotation_account(state_path):
+    """Next account after the last-used one; wraps around the pool."""
+    last = _read_rotation_state(state_path)
+    if last in ROTATION_POOL:
+        return ROTATION_POOL[(ROTATION_POOL.index(last) + 1) % len(ROTATION_POOL)]
+    return ROTATION_POOL[0]
+
+
+def cmd_account(args):
+    """Account ops: list, switch, or rotate to the next training-track
+    account. Rotation never selects an excluded account."""
+    action = getattr(args, "account_action", "list")
+    if action == "list":
+        rows = {}
+        for p in sorted(TOKEN_DIR.glob("token.*.json")):
+            name = p.name[len("token."):-len(".json")]
+            rows[name] = {"active": name == _active_account(),
+                          "expiry": _token_expiry(p)}
+        write_output(json.dumps(rows, indent=2), args.out, args.json, rows)
+    elif action == "switch":
+        name = getattr(args, "name", None)
+        if not name:
+            die("account-no-name", "Provide an account name")
+        _switch_account(name)
+        ok, detail = _refresh_token_file(TOKEN_FILE)
+        write_output(f"Active account: {name} (token refresh: "
+                     f"{'ok' if ok else 'fail:' + detail})",
+                     args.out, args.json,
+                     {"account": name, "refresh": ok})
+    elif action == "rotate":
+        state_path = getattr(args, "rotation_file", None) or str(ROTATION_STATE_DEFAULT)
+        nxt = _next_rotation_account(state_path)
+        _switch_account(nxt)
+        ok, detail = _refresh_token_file(TOKEN_FILE)
+        _write_rotation_state(state_path, nxt)
+        write_output(f"Rotated to {nxt} (token refresh: "
+                     f"{'ok' if ok else 'fail:' + detail})",
+                     args.out, args.json,
+                     {"account": nxt, "refresh": ok,
+                      "state_file": state_path})
+
+
+def _health_check(session, attempts=3, gap=10):
+    """True if the session's kernel answers a trivial exec. A session
+    that passes `new` but fails this is a phantom (normtune Oct 2026:
+    runtime proxy 404s, VM never usable) — never let a run start on it."""
+    for i in range(attempts):
+        stdout, stderr, rc = run_colab(
+            ["exec", "-s", session, "--timeout", "30"], timeout=45,
+            stdin_data="print('HEALTH_OK')")
+        if rc == 0 and "HEALTH_OK" in stdout:
+            return True
+        if i < attempts - 1:
+            time.sleep(gap)
+    return False
+
+
+def _launch_detached(session, remote_script, log_file, env_map):
+    """Launch a script on the VM detached (Popen, start_new_session).
+    Returns (pid, log_file) or dies."""
+    env_code = ", ".join(f"{json.dumps(k)}: {json.dumps(v)}"
+                         for k, v in env_map.items())
+    launch_code = (
+        "import subprocess, sys, os\n"
+        "p = subprocess.Popen(\n"
+        "    [sys.executable, %s],\n"
+        "    stdout=open(%s, 'w'), stderr=subprocess.STDOUT,\n"
+        "    start_new_session=True, cwd='/content',\n"
+        "    env={**os.environ, %s})\n"
+        "print(f'PID:{p.pid}|LOG:%s')"
+    ) % (json.dumps(remote_script), json.dumps(log_file), env_code, log_file)
+    stdout, stderr, rc = _remote_pexec(session, launch_code, timeout=20)
+    if rc == 0 and "PID:" in stdout:
+        pid = stdout.strip().split("PID:")[1].split("|")[0].strip()
+        return pid, log_file
+    die("train-launch-failed", (stdout or "").strip()[-300:])
+
+
+def _vm_log_has_marker(session, path, marker):
+    """True if the done-marker appears ANYWHERE in the log. A tail-window
+    check misses it when the driver prints a long block after the marker
+    (verify3, Oct 2026: a ~56-line results JSON after DONE. metrics fell
+    outside the 40-line tail, so a completed run read as DIED). Grep the
+    whole file; print only FOUND/MISS, never the content."""
+    code = ("try:\n"
+            "    data = open(%s, errors='ignore').read()\n"
+            "    print('FOUND' if %s in data else 'MISS')\n"
+            "except Exception:\n"
+            "    print('MISS')") % (json.dumps(path), json.dumps(marker))
+    stdout, stderr, rc = _remote_pexec(session, code, timeout=30)
+    return rc == 0 and "FOUND" in stdout
+
+
+def _vm_tail(session, path, lines=30):
+    code = ("import subprocess\n"
+            "r = subprocess.run(['tail', '-n', str(%d), %s], capture_output=True, text=True)\n"
+            "print(r.stdout, end='')") % (lines, json.dumps(path))
+    stdout, stderr, rc = _remote_pexec(session, code, timeout=20)
+    return stdout if rc == 0 else ""
+
+
+def _vm_pid_alive(session, pid):
+    """True only if the PID is a LIVE process. A zombie (defunct) process
+    still answers `ps -p` with returncode 0, so the state must be checked
+    explicitly — otherwise a dead driver reads as alive and the monitor
+    waits out its whole budget (toolselect-verify, Oct 2026: PID 694
+    defunct, monitor would have sat until TIMEOUT instead of DIED)."""
+    code = ("import subprocess\n"
+            "r = subprocess.run(['ps', '-o', 'stat=', '-p', %s], capture_output=True, text=True)\n"
+            "st = (r.stdout or '').strip()\n"
+            "print('ALIVE' if (r.returncode == 0 and st and 'Z' not in st) else 'GONE')") % json.dumps(str(pid))
+    stdout, stderr, rc = _remote_pexec(session, code, timeout=20)
+    return rc == 0 and "ALIVE" in stdout
+
+
+def _vm_file_exists(session, path):
+    code = "import os; print('YES' if os.path.exists(%s) else 'NO')" % json.dumps(path)
+    stdout, stderr, rc = _remote_pexec(session, code, timeout=20)
+    return rc == 0 and "YES" in stdout
+
+
+def cmd_train(args):
+    """House one daily training-track run end to end: account rotation,
+    token refresh, session create (with health check + cross-account retry
+    on gpu-unavailable/provision failure), driver upload, detached launch,
+    supervised monitoring, result download, honest outcome classification.
+
+    Outcome vocabulary (mirrors the arXiv verdicts, but for the RUN):
+      DONE      — done-marker seen in the log (or done-file exists)
+      RECLAIMED — session vanished from the server mid-run (free tier)
+      DIED      — driver process gone with no marker (silent death; check
+                  the downloaded log tail for the last lines)
+      TIMEOUT   — monitor budget exhausted, run still going (session left
+                  up unless --no-keep is passed; re-run with --watch-only)
+    A DONE run still needs its metrics judged by the paper's own criteria;
+    this command classifies the run, not the paper."""
+    _pre_auth_check()
+    gpu = getattr(args, "gpu", "T4") or "T4"
+    session = getattr(args, "session", None)
+    if not session:
+        session = f"train-{datetime.now().strftime('%m%d-%H%M')}"
+    log_file = getattr(args, "log", None) or "/content/train_run.log"
+    marker = getattr(args, "done_marker", None) or "TRAIN_DONE"
+    poll = max(15, getattr(args, "poll", 60) or 60)
+    budget = max(60, getattr(args, "monitor_timeout", 7200) or 7200)
+    out_dir = Path(getattr(args, "out_dir", None) or
+                   (COLAB_HOME / "train-runs" / session))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # -- Resolve account -------------------------------------------------
+    account = _active_account()
+    if getattr(args, "rotate", False):
+        state_path = getattr(args, "rotation_file", None) or str(ROTATION_STATE_DEFAULT)
+        account = _next_rotation_account(state_path)
+        _switch_account(account)
+        _write_rotation_state(state_path, account)
+    elif getattr(args, "account", None):
+        account = _switch_account(args.account)
+    ok, detail = _refresh_token_file(TOKEN_FILE)
+    if not ok:
+        die("train-auth-failed",
+            f"Token refresh failed for {account}: {detail}. "
+            "invalid-grant means the refresh token is dead — re-do the "
+            "browser OAuth code flow (references/auth_flow.md).")
+
+    summary = {"session": session, "account": account, "gpu": gpu,
+               "log": log_file, "outcome": None, "downloaded": []}
+
+    if not getattr(args, "watch_only", False):
+        # -- Create with health check + cross-account retry --------------
+        tried = []
+        created = False
+        candidates = [account] + [a for a in ROTATION_POOL if a != account]
+        for cand in candidates[:max(1, getattr(args, "max_accounts", 5) or 5)]:
+            if cand != account:
+                _switch_account(cand)
+                account = cand
+                ok, detail = _refresh_token_file(TOKEN_FILE)
+                if not ok:
+                    tried.append({"account": cand, "error": f"auth:{detail}"})
+                    continue
+            stdout, stderr, rc = run_colab(
+                ["new", "-s", session, "--gpu", gpu], timeout=180)
+            if rc != 0:
+                code, _ = parse_error(stdout, stderr)
+                tried.append({"account": cand, "error": code or "new-failed"})
+                if code not in ("gpu-unavailable", "capacity", "quota-exceeded"):
+                    break
+                continue
+            if getattr(args, "no_health_check", False) or _health_check(session):
+                created = True
+                break
+            tried.append({"account": cand, "error": "provision-failed"})
+            # Phantom session: stop it so it does not linger, then try next.
+            run_colab(["stop", "-s", session], timeout=60)
+        summary["create_attempts"] = tried
+        summary["account"] = account
+        if getattr(args, "rotate", False):
+            # Fallback may have moved to a different account than the one
+            # rotation picked (verify5, Oct 2026: picked ppoppo205, ran on
+            # cyc236es). The state file must name the account that actually
+            # ran, or the next day repeats it.
+            _write_rotation_state(state_path, account)
+        if not created:
+            summary["outcome"] = "PROVISION_FAILED"
+            (out_dir / "train-run.json").write_text(json.dumps(summary, indent=2))
+            write_output(json.dumps(summary, indent=2), args.out, args.json, summary)
+            return
+        _registry_record(session, account, {"gpu": gpu, "log": log_file})
+        # Record the endpoint too: a session created under an isolated
+        # registry shows up as "[?]" in the global list, so the monitor
+        # must be able to match by endpoint as well as by name.
+        smap = _server_session_map()
+        if smap and session in smap:
+            summary["endpoint"] = smap[session]
+            _registry_record(session, account,
+                             {"gpu": gpu, "log": log_file,
+                              "endpoint": smap[session]})
+
+        # -- Upload + launch ----------------------------------------------
+        driver = Path(args.driver)
+        if not driver.exists():
+            die("train-no-driver", f"Driver not found: {args.driver}")
+        remote_driver = f"/content/{driver.name}"
+        stdout, stderr, rc = run_colab(
+            ["upload", "-s", session, str(driver), remote_driver], timeout=120)
+        check_rc(stdout, stderr, rc, "upload-failed", "Driver upload failed")
+        for extra in (getattr(args, "upload", None) or []):
+            local, _, remote = extra.partition(":")
+            remote = remote or f"/content/{Path(local).name}"
+            stdout, stderr, rc = run_colab(
+                ["upload", "-s", session, local, remote], timeout=120)
+            check_rc(stdout, stderr, rc, "upload-failed", f"Upload failed: {local}")
+        env_map = {}
+        for e in (getattr(args, "env", None) or []):
+            k, _, v = e.partition("=")
+            if k:
+                env_map[k] = v
+        pid, _ = _launch_detached(session, remote_driver, log_file, env_map)
+        summary["pid"] = pid
+        (out_dir / "train-run.json").write_text(json.dumps(summary, indent=2))
+    else:
+        pid = getattr(args, "pid", None)
+        summary["pid"] = pid
+        summary["watch_only"] = True
+        reg = _registry_load().get(session, {})
+        if reg.get("endpoint"):
+            summary["endpoint"] = reg["endpoint"]
+        if reg.get("account"):
+            # The registry names the account that created the session;
+            # the active token may have moved since (shared VM).
+            summary["account"] = reg["account"]
+
+    # -- Monitor ----------------------------------------------------------
+    deadline = time.time() + budget
+    last_tail = ""
+    outcome = "TIMEOUT"
+    while time.time() < deadline:
+        tail = _vm_tail(session, log_file, lines=40)
+        if tail:
+            last_tail = tail
+        if _vm_log_has_marker(session, log_file, marker):
+            outcome = "DONE"
+            break
+        if getattr(args, "done_file", None) and _vm_file_exists(session, args.done_file):
+            outcome = "DONE"
+            break
+        server = _server_session_map()
+        if server is not None:
+            ep = summary.get("endpoint")
+            if session not in server and not (ep and ep in set(server.values())):
+                outcome = "RECLAIMED"
+                break
+        pid = summary.get("pid")
+        if pid and not _vm_pid_alive(session, pid):
+            # Process gone: re-check once after a short gap (log flush race).
+            time.sleep(10)
+            tail2 = _vm_tail(session, log_file, lines=40)
+            if tail2:
+                last_tail = tail2
+            if (not _vm_log_has_marker(session, log_file, marker)
+                    and not _vm_pid_alive(session, pid)):
+                outcome = "DIED"
+                break
+        time.sleep(poll)
+    summary["outcome"] = outcome
+    summary["log_tail"] = last_tail[-2000:] if last_tail else ""
+
+    # -- Download results + teardown --------------------------------------
+    if outcome in ("DONE", "DIED", "TIMEOUT"):
+        for remote in (getattr(args, "results", None) or []):
+            local = out_dir / Path(remote).name
+            stdout, stderr, rc = run_colab(
+                ["download", "-s", session, remote, str(local)], timeout=120)
+            if rc == 0 and local.exists():
+                summary["downloaded"].append(str(local))
+    if outcome in ("DONE", "DIED", "RECLAIMED"):
+        _registry_remove(session)
+    if not getattr(args, "keep", False) and outcome in ("DONE", "DIED"):
+        run_colab(["stop", "-s", session], timeout=60)
+    if outcome == "RECLAIMED":
+        # Server already took it; drop the stale registry entry only.
+        _registry_remove(session)
+    (out_dir / "train-run.json").write_text(json.dumps(summary, indent=2))
+    write_output(json.dumps(summary, indent=2), args.out, args.json, summary)
+
+
 # ─── CLI ───────────────────────────────────────────────────────────────────
 
 def build_parser():
-    p = argparse.ArgumentParser(description="colab-cli v3.2 — AI-agent-native CLI for Google Colab",
+    p = argparse.ArgumentParser(description="colab-cli v3.3 — AI-agent-native CLI for Google Colab",
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     shared_output = argparse.ArgumentParser(add_help=False)
     shared_output.add_argument("-o", "--out", help="Write output to FILE, stdout gets JSON pointer")
     shared_output.add_argument("--json", action="store_true", help="Structured JSON output")
+    shared_output.add_argument("--registry-file", help="Isolated session-registry file "
+        "(passed as --config to the raw CLI; keeps this run's sessions safe "
+        "from another agent's global account switches)")
 
     sub = p.add_subparsers(dest="command")
 
     # Session management
     pn = sub.add_parser("new", parents=[shared_output], help="Create session")
     pn.add_argument("-s", "--session"); pn.add_argument("--gpu", choices=["T4","L4","G4","H100","A100"]); pn.add_argument("--tpu", choices=["v5e1","v6e1"])
+    pn.add_argument("--no-health-check", action="store_true", help="Skip the kernel health check after create")
     sub.add_parser("sessions", parents=[shared_output], help="List sessions")
     ps = sub.add_parser("status", parents=[shared_output], help="Session status"); ps.add_argument("-s", "--session")
     ps2 = sub.add_parser("stop", parents=[shared_output], help="Stop session"); ps2.add_argument("-s", "--session")
@@ -1338,6 +1944,36 @@ def build_parser():
     pra = sub.add_parser("reauth", parents=[shared_output], help="Re-auth / switch Colab account (per-account GPU quota)"); pra.add_argument("--account", help="login_hint email")
     ppp = sub.add_parser("patch", parents=[shared_output], help="Patch installed colab_cli: 401/404 -> refresh token + retry")
 
+    # Training-track housing (v3.3)
+    ptok = sub.add_parser("token", parents=[shared_output], help="OAuth token ops (never prints secrets)")
+    ptok.add_argument("token_action", nargs="?", default="status", choices=["status", "refresh", "refresh-all"])
+    ptok.add_argument("--force", action="store_true", help="Refresh-all: refresh even fresh tokens")
+    pacc = sub.add_parser("account", parents=[shared_output], help="Colab account ops + daily rotation")
+    pacc.add_argument("account_action", nargs="?", default="list", choices=["list", "switch", "rotate"])
+    pacc.add_argument("name", nargs="?", help="Account for switch")
+    pacc.add_argument("--rotation-file", help="Rotation state file (default: arxiv goal hidden_files)")
+    ptr = sub.add_parser("train", parents=[shared_output], help="House one daily training-track run end to end")
+    ptr.add_argument("--driver", required=True, help="Local driver script to upload + launch")
+    ptr.add_argument("-s", "--session", help="Session name (default train-MMDD-HHMM)")
+    ptr.add_argument("--gpu", choices=["T4", "L4", "G4", "H100", "A100"], default="T4")
+    ptr.add_argument("--account", help="Switch to this account first (refuses excluded accounts)")
+    ptr.add_argument("--rotate", action="store_true", help="Rotate to the next daily account first")
+    ptr.add_argument("--rotation-file", help="Rotation state file (default: arxiv goal hidden_files)")
+    ptr.add_argument("--max-accounts", type=int, default=5, help="Max accounts to try on provision failure")
+    ptr.add_argument("--log", default="/content/train_run.log", help="Remote driver log path")
+    ptr.add_argument("--done-marker", default="TRAIN_DONE", help="Log marker meaning the run finished")
+    ptr.add_argument("--done-file", help="Remote file whose existence means the run finished")
+    ptr.add_argument("--results", nargs="*", default=[], help="Remote result files to download on DONE/DIED/TIMEOUT")
+    ptr.add_argument("--upload", nargs="*", default=[], help="Extra local files to upload (LOCAL or LOCAL:REMOTE)")
+    ptr.add_argument("--env", nargs="*", default=[], help="Driver env vars (KEY=VALUE)")
+    ptr.add_argument("--out-dir", help="Local dir for downloads + train-run.json")
+    ptr.add_argument("--poll", type=int, default=60, help="Monitor poll interval seconds")
+    ptr.add_argument("--monitor-timeout", type=int, default=7200, help="Monitor budget seconds")
+    ptr.add_argument("--no-health-check", action="store_true", help="Skip kernel health check after create")
+    ptr.add_argument("--keep", action="store_true", help="Do not stop the session on DONE/DIED")
+    ptr.add_argument("--watch-only", action="store_true", help="Only monitor an existing session (no create/upload/launch)")
+    ptr.add_argument("--pid", help="Driver PID for watch-only process-liveness checks")
+
     return p
 
 
@@ -1345,6 +1981,8 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     if not args.command: parser.print_help(); sys.exit(1)
+    global CONFIG_FILE
+    CONFIG_FILE = getattr(args, "registry_file", None)
     if not COLAB or not os.path.isfile(COLAB):
         die("no-colab-cli", "google-colab-cli not found. Install: pip install google-colab-cli")
 
@@ -1362,6 +2000,7 @@ def main():
         "pay": cmd_pay, "version": cmd_version, "update": cmd_update, "whoami": cmd_whoami,
         "secrets": cmd_secrets, "resources": cmd_resources, "share": cmd_share,
         "recover": cmd_recover, "reauth": cmd_reauth, "patch": cmd_patch,
+        "token": cmd_token, "account": cmd_account, "train": cmd_train,
     }
     try:
         dispatcher[args.command](args)
