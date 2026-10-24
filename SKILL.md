@@ -289,3 +289,56 @@ weight stacks run on it. The levers, in order of impact:
    in ~2–12h), `exec_detach` + Cloudflare tunnel for servers, retry
    watchdogs. HF token optional but avoids anonymous rate limits on big
    downloads — pass via env/file, never hardcoded.
+
+## v3.3 — Training-track housing (Oct 2026)
+
+The daily arXiv training track now runs through one command instead of a
+hand-assembled new/upload/exec/monitor chain:
+
+```bash
+python3 colab.py train --driver colab_rl_toolselect.py --rotate \
+  --results /content/toolselect_metrics.csv --out-dir ./run-out
+```
+
+`train` houses: account rotation (`--rotate`, daily pool ppoppo205 →
+cyc236es → kyu008008 → kyu009009 → cyc236ha; cyc236de/cyc236hk never
+selected), proxy-aware token refresh, session create with a kernel health
+check (a session that passes `new` but never answers is a phantom — the
+normtune Oct 2026 failure), cross-account retry on gpu-unavailable /
+provision failure, driver upload, detached launch, supervised monitoring,
+result download, and an honest outcome: DONE / RECLAIMED / DIED / TIMEOUT /
+PROVISION_FAILED, written to `<out-dir>/train-run.json`.
+
+Supporting commands:
+- `token refresh | refresh-all | status` — proxy-aware refresh; refresh-all
+  covers the rotation pool only, never prints secrets.
+- `account list | switch <name> | rotate` — rotation state lives in the
+  arXiv goal's `hidden_files/colab_account_rotation.txt`.
+- `--registry-file <f>` on any command — passes `--config <f>` to the raw
+  CLI, so isolated-state work keeps the wrapper's refresh/retry/registry.
+  Never call raw `colab_cli.cli` directly: its google-auth transport
+  ignores proxy env and falls into interactive OAuth on token expiry, and
+  its `sessions` output prints names bracketed (`[name]`), which the old
+  parser kept verbatim and once misclassified a live session as RECLAIMED.
+
+Driver contract for `train`: print a done-marker (default `TRAIN_DONE`) to
+stdout on completion, flush logs, and write result files to /content.
+Reclamation cannot be prevented on free tier — checkpoint to /content
+(or Drive) so a re-run resumes instead of restarting.
+
+## v3.3 fix — zombie processes fool PID liveness (Oct 2026)
+
+`ps -p PID` returns 0 for a defunct (zombie) process, so a dead driver
+reads as alive and the `train` monitor waits out its whole budget instead
+of reporting DIED. The liveness check now reads `ps -o stat=` and treats
+state `Z` as dead. Found on the ToolSelect verification run (PID 694
+defunct after the RL grad crash; the first monitor would have sat until
+TIMEOUT).
+
+## v3.3 fix — done-marker must be grepped, not tailed (Oct 2026)
+
+The `train` monitor once classified a completed run as DIED: the driver
+printed `DONE. metrics` and then a ~56-line results JSON, so the marker
+fell outside the monitor's 40-line tail window, and the normally-exited
+process read as dead. The monitor now greps the whole log for the marker
+every poll. Drivers should still print the marker as their very last line.
