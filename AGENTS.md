@@ -247,3 +247,26 @@ Error output: `{"ok":false,"err":"<code>","msg":"<message>"}` (~25 tokens)
     batch 4 / seq 512 / lr 2e-4, bf16 NOT fp16, transformers<5.0, uninstall
     torchao, no `prepare_model_for_kbit_training()`). This is the arXiv
     training track's graduation path from 0.5B toys.
+18. **v3.3 training-track housing (Oct 2026)** — `colab.py train` runs a
+    whole daily training-track job (rotate → refresh → create+health-check
+    with cross-account retry → upload → detached launch → monitored run →
+    download → DONE/RECLAIMED/DIED/TIMEOUT/PROVISION_FAILED). `token
+    refresh-all` + a 45-min watchdog cron keep the rotation pool's tokens
+    fresh (Google access tokens live 3600s, not extendable). Never call raw
+    `colab_cli.cli` directly: its google-auth transport ignores proxy env
+    (interactive-OAuth hang on expiry) and its `sessions` output brackets
+    names (`[name]`), which a naive parser keeps verbatim. Wrapper-side
+    session registry distinguishes RECLAIMED from never-existed.
+19. **Zombie liveness (Oct 2026)** — `ps -p` exits 0 on defunct processes;
+    `train`'s PID check now uses `ps -o stat=` and treats `Z` as dead, or a
+    crashed driver reads as alive until monitor timeout.
+20. **Done-marker grep + rotation-fallback state (Oct 2026)** — the
+    monitor greps the WHOLE log for the done-marker every poll, not a
+    40-line tail: a driver that prints a long block after the marker
+    (verify3's ~56-line results JSON) otherwise reads as DIED on normal
+    exit. Drivers should still print the marker last. And when `--rotate`
+    falls back to another account at creation, `train` rewrites the
+    rotation state to the account that actually ran (verify5: picked
+    ppoppo205, ran on cyc236es), or the next day repeats the fallback
+    account. Watch-only records prefer the wrapper registry's account
+    over the live active token (shared VM: the symlink may have moved).
